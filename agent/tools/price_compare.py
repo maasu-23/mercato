@@ -23,14 +23,26 @@ def _get_s3_client():
     return _s3_client
 
 
+_NON_FINITE = {"nan", "inf", "-inf", "+inf", "infinity", "-infinity", "+infinity"}
+_CURRENCY_CHARS = "₹$€£,"
+
+
 def _to_float(value) -> float | None:
     """Coerce a price value to float, returning None if it cannot be parsed."""
     if value is None:
         return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.lower() in _NON_FINITE:
+            return None
+        value = stripped.translate(str.maketrans("", "", _CURRENCY_CHARS))
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return None
+    if result != result or result in (float("inf"), float("-inf")):
+        return None
+    return result
 
 
 @tool
@@ -85,7 +97,7 @@ def price_compare(
     for product in unpriced:
         ranked.append({**product, "best_deal": False})
 
-    cheapest = ranked[0] if ranked else None
+    cheapest = ranked[0] if priced else None
 
     s3_artifact = None
     bucket_name = os.getenv("S3_BUCKET_NAME", "")
