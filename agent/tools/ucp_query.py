@@ -61,6 +61,23 @@ def ucp_query(query: str, category: str = "", max_results: int = 6) -> list[dict
         )
         response.raise_for_status()
         payload = response.json()
+
+        results = []
+        for item in payload.get("results", []):
+            results.append(
+                {
+                    "source": "ucp",
+                    "title": item.get("title"),
+                    "merchant": item.get("merchant"),
+                    "price": item.get("price"),
+                    "currency": item.get("currency", DEFAULT_CURRENCY),
+                    "in_stock": item.get("in_stock"),
+                    "url": item.get("permalink_url"),
+                    "product_id": item.get("product_id"),
+                    "image_url": item.get("image_url"),
+                }
+            )
+        return results
     except httpx.TimeoutException:
         return [{"source": "ucp", "error": "UCP request timed out — falling back to web_search"}]
     except httpx.HTTPStatusError as e:
@@ -72,20 +89,3 @@ def ucp_query(query: str, category: str = "", max_results: int = 6) -> list[dict
         ]
     except Exception as e:
         return [{"source": "ucp", "error": f"UCP unavailable: {e} — falling back to web_search"}]
-
-    results = []
-    for item in payload.get("results", []):
-        results.append(
-            {
-                "source": "ucp",
-                "title": item.get("title"),
-                "merchant": item.get("merchant"),
-                "price": item.get("price"),
-                "currency": item.get("currency", DEFAULT_CURRENCY),
-                "in_stock": item.get("in_stock"),
-                "url": item.get("permalink_url"),
-                "product_id": item.get("product_id"),
-                "image_url": item.get("image_url"),
-            }
-        )
-    return results
