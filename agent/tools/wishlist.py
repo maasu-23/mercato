@@ -36,12 +36,16 @@ def _product_id_for_url(url: str) -> str:
     return hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
 
 
+NO_USER_ID_ERROR = "Could not determine user identity — session may not be initialized correctly."
+
+
 def _user_id_from_state(state: AgentState) -> str:
-    """Pull the user_id out of the injected agent state, or fail loudly."""
-    user_id = (state or {}).get("user_id", "")
-    if not user_id:
-        raise ValueError("No user_id in agent state — the session was not initialised correctly.")
-    return user_id
+    """Pull the user_id out of the injected agent state.
+
+    Returns an empty string if it is missing, so the calling tool can surface an
+    error dict rather than raising.
+    """
+    return (state or {}).get("user_id", "")
 
 
 def fetch_wishlist(user_id: str) -> list[dict]:
@@ -50,6 +54,10 @@ def fetch_wishlist(user_id: str) -> list[dict]:
     The plain-function core of the get_wishlist tool. Exposed separately so the
     CLI can read the wishlist directly, without constructing agent state or
     spending a model turn.
+
+    Unlike the tools, this returns a bare list and lets DynamoDB errors propagate:
+    it is not LLM-facing, so the error-dict convention buys nothing here, and its
+    only caller (cli/main.py) already handles the exception and renders the list.
     """
     response = _get_table().query(KeyConditionExpression=Key("user_id").eq(user_id))
     items = response.get("Items", [])
@@ -81,9 +89,15 @@ def save_wishlist(
         currency: Price currency (default "INR").
 
     Returns:
-        A dict: {"saved": True, "product_id": ..., "title": ...}.
+        A dict. On success:
+            {"saved": True, "product_id": ..., "title": ...}
+        On failure — the session carries no user identity, or the DynamoDB write
+        fails — a dict with an "error" key describing what went wrong. Never
+        raises for these expected failures.
     """
     user_id = _user_id_from_state(state)
+    if not user_id:
+        return {"error": NO_USER_ID_ERROR}
 
     product_id = _product_id_for_url(url)
 
@@ -100,19 +114,34 @@ def save_wishlist(
     if price is not None:
         item["price"] = str(price)
 
-    _get_table().put_item(Item=item)
+    try:
+        _get_table().put_item(Item=item)
+    except Exception as e:
+        return {"error": f"Could not save to your wishlist: {e}"}
 
     return {"saved": True, "product_id": product_id, "title": title}
 
 
 @tool
-def get_wishlist(state: Annotated[AgentState, InjectedState]) -> list[dict]:
+def get_wishlist(state: Annotated[AgentState, InjectedState]) -> dict:
     """Retrieve everything on the current user's wishlist, newest first.
 
     Takes no arguments — the wishlist always belongs to the user in the current
     session.
 
     Returns:
-        A list of wishlist item dicts, newest first.
+        A dict. On success:
+            {"items": [...]} — the wishlist item dicts, newest first. An empty
+            list means the wishlist is empty, which is not an error.
+        On failure — the session carries no user identity, or the DynamoDB read
+        fails — a dict with an "error" key describing what went wrong. Never
+        raises for these expected failures.
     """
-    return fetch_wishlist(_user_id_from_state(state))
+    user_id = _user_id_from_state(state)
+    if not user_id:
+        return {"error": NO_USER_ID_ERROR}
+
+    try:
+        return {"items": fetch_wishlist(user_id)}
+    except Exception as e:
+        return {"error": f"Could not load your wishlist: {e}"}

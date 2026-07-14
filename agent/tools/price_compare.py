@@ -73,9 +73,13 @@ def price_compare(
             ranked: The full sorted product list — priced items cheapest first
                 (each flagged with "best_deal"), followed by unpriced items.
             total: The number of real products ranked.
-            cheapest: The cheapest product dict, or None if the list is empty.
+            cheapest: The cheapest priced product dict, or None if no product
+                carried a usable price.
             s3_artifact: The "s3://..." path of the saved artifact, or None if
-                nothing was saved.
+                nothing was saved (including when the upload failed — see below).
+
+        Never raises for expected failures. A failed S3 upload is intentionally
+        not surfaced as an "error" key, since the ranking itself still succeeded.
     """
     user_id = (state or {}).get("user_id", "")
 
@@ -117,6 +121,11 @@ def price_compare(
             )
             s3_artifact = f"s3://{bucket_name}/{key}"
         except Exception:
+            # Deliberate exception to the "return an error dict" convention the
+            # other tools follow: persisting the snapshot is a background
+            # nice-to-have, not what the caller asked for. The ranking is still
+            # perfectly valid without it, so a failed upload is reported as
+            # s3_artifact=None rather than failing the whole comparison.
             s3_artifact = None
 
     return {
