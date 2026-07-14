@@ -2,7 +2,7 @@ import os
 import sys
 
 import boto3
-from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.exceptions import ClientError, NoCredentialsError, WaiterError
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
@@ -12,6 +12,15 @@ console = Console()
 DEFAULT_REGION = "ap-south-1"
 
 TAVILY_PLACEHOLDERS = {"", "your-tavily-api-key", "changeme", "your_tavily_api_key_here"}
+
+# Tags every created resource so costs can be attributed and stray resources
+# identified. DynamoDB and S3 take the same pairs in different shapes.
+PROJECT_TAGS = {"Project": "mercato"}
+
+# Session transcripts and comparison artifacts under users/ accumulate forever
+# otherwise — nothing in the app ever deletes them.
+ARTIFACT_EXPIRATION_DAYS = 90
+ARTIFACT_PREFIX = "users/"
 
 
 def load_config() -> dict:
@@ -35,6 +44,26 @@ def get_clients(region: str) -> dict:
     }
 
 
+def enable_point_in_time_recovery(dynamodb, table_name: str) -> None:
+    """Turn on PITR so an accidental delete or bad write can be rolled back."""
+    try:
+        dynamodb.update_continuous_backups(
+            TableName=table_name,
+            PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True},
+        )
+        console.print(f"  [green]✔[/green] Enabled point-in-time recovery on '{table_name}'")
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        # DynamoDB rejects re-enabling PITR that is already on, which is a no-op
+        # for our purposes rather than a failure.
+        if code == "ContinuousBackupsUnavailableException":
+            console.print(
+                f"  [yellow]![/yellow] Point-in-time recovery already enabled on '{table_name}' — skipping"
+            )
+        else:
+            console.print(f"  [red]✘[/red] Failed to enable PITR on '{table_name}': {e}")
+
+
 def create_dynamodb_table(dynamodb, table_name: str, sort_key_name: str) -> None:
     try:
         dynamodb.create_table(
@@ -48,6 +77,7 @@ def create_dynamodb_table(dynamodb, table_name: str, sort_key_name: str) -> None
                 {"AttributeName": sort_key_name, "KeyType": "RANGE"},
             ],
             BillingMode="PAY_PER_REQUEST",
+            Tags=[{"Key": k, "Value": v} for k, v in PROJECT_TAGS.items()],
         )
         console.print(f"[green]✔[/green] Created DynamoDB table '{table_name}'")
     except ClientError as e:
@@ -56,6 +86,38 @@ def create_dynamodb_table(dynamodb, table_name: str, sort_key_name: str) -> None
             console.print(f"[yellow]![/yellow] DynamoDB table '{table_name}' already exists — skipping")
         else:
             console.print(f"[red]✘[/red] Failed to create DynamoDB table '{table_name}': {e}")
+            return
+
+    # PITR can only be set once the table leaves CREATING, and tags must be
+    # reapplied on pre-existing tables that predate this script — so both run
+    # outside the create, on every pass.
+    wait_for_table_active(dynamodb, table_name)
+    tag_dynamodb_table(dynamodb, table_name)
+    enable_point_in_time_recovery(dynamodb, table_name)
+
+
+def wait_for_table_active(dynamodb, table_name: str) -> bool:
+    try:
+        dynamodb.get_waiter("table_exists").wait(
+            TableName=table_name, WaiterConfig={"Delay": 2, "MaxAttempts": 30}
+        )
+        return True
+    except (ClientError, WaiterError) as e:
+        console.print(f"  [red]✘[/red] Table '{table_name}' never became active: {e}")
+        return False
+
+
+def tag_dynamodb_table(dynamodb, table_name: str) -> None:
+    """Apply project tags. Idempotent — tag_resource overwrites existing keys."""
+    try:
+        arn = dynamodb.describe_table(TableName=table_name)["Table"]["TableArn"]
+        dynamodb.tag_resource(
+            ResourceArn=arn,
+            Tags=[{"Key": k, "Value": v} for k, v in PROJECT_TAGS.items()],
+        )
+        console.print(f"  [green]✔[/green] Tagged '{table_name}' with {PROJECT_TAGS}")
+    except ClientError as e:
+        console.print(f"  [red]✘[/red] Failed to tag '{table_name}': {e}")
 
 
 def create_wishlist_table(dynamodb, table_name: str) -> None:
@@ -80,6 +142,46 @@ def block_public_access(s3, bucket_name: str) -> None:
         console.print(f"[green]✔[/green] Blocked all public access on '{bucket_name}'")
     except ClientError as e:
         console.print(f"[red]✘[/red] Failed to apply public access block on '{bucket_name}': {e}")
+
+
+def tag_s3_bucket(s3, bucket_name: str) -> None:
+    """Apply project tags. Idempotent — put_bucket_tagging replaces the whole tag set."""
+    try:
+        s3.put_bucket_tagging(
+            Bucket=bucket_name,
+            Tagging={"TagSet": [{"Key": k, "Value": v} for k, v in PROJECT_TAGS.items()]},
+        )
+        console.print(f"[green]✔[/green] Tagged '{bucket_name}' with {PROJECT_TAGS}")
+    except ClientError as e:
+        console.print(f"[red]✘[/red] Failed to tag bucket '{bucket_name}': {e}")
+
+
+def set_lifecycle_policy(s3, bucket_name: str) -> None:
+    """Expire session transcripts and comparison artifacts after a fixed window.
+
+    Nothing in the app ever deletes what it writes under users/, so without this
+    the bucket grows without bound.
+    """
+    try:
+        s3.put_bucket_lifecycle_configuration(
+            Bucket=bucket_name,
+            LifecycleConfiguration={
+                "Rules": [
+                    {
+                        "ID": f"expire-{ARTIFACT_PREFIX.rstrip('/')}-after-{ARTIFACT_EXPIRATION_DAYS}d",
+                        "Status": "Enabled",
+                        "Filter": {"Prefix": ARTIFACT_PREFIX},
+                        "Expiration": {"Days": ARTIFACT_EXPIRATION_DAYS},
+                    }
+                ]
+            },
+        )
+        console.print(
+            f"[green]✔[/green] Objects under '{ARTIFACT_PREFIX}' now expire after "
+            f"{ARTIFACT_EXPIRATION_DAYS} days"
+        )
+    except ClientError as e:
+        console.print(f"[red]✘[/red] Failed to set lifecycle policy on '{bucket_name}': {e}")
 
 
 def create_s3_bucket(s3, bucket_name: str, region: str) -> None:
@@ -110,7 +212,11 @@ def create_s3_bucket(s3, bucket_name: str, region: str) -> None:
             console.print(f"[red]✘[/red] Failed to create S3 bucket '{bucket_name}': {e}")
             return
 
+    # All three run on every pass, not just on create, so a bucket that predates
+    # this script picks them up too.
     block_public_access(s3, bucket_name)
+    tag_s3_bucket(s3, bucket_name)
+    set_lifecycle_policy(s3, bucket_name)
 
 
 def verify_bedrock_access(bedrock, bedrock_runtime, model_id: str) -> None:
@@ -164,8 +270,15 @@ def print_iam_permissions() -> None:
     table.add_column("Purpose", style="white")
 
     table.add_row("dynamodb:CreateTable", "Create the wishlist and sessions tables")
+    table.add_row("dynamodb:DescribeTable / TagResource", "Tag the tables for cost tracking")
+    table.add_row("dynamodb:UpdateContinuousBackups", "Enable point-in-time recovery on the tables")
     table.add_row("s3:CreateBucket", "Create the session logs / artifacts bucket")
     table.add_row("s3:PutBucketPublicAccessBlock", "Lock the bucket down from public access")
+    table.add_row("s3:PutBucketTagging", "Tag the bucket for cost tracking")
+    table.add_row(
+        "s3:PutLifecycleConfiguration",
+        f"Expire objects under {ARTIFACT_PREFIX} after {ARTIFACT_EXPIRATION_DAYS} days",
+    )
     table.add_row("bedrock:ListFoundationModels", "Verify Claude Sonnet 4.5 is available")
     table.add_row(
         "bedrock:InvokeModel / bedrock-runtime:Converse",
