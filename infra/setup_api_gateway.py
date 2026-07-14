@@ -19,6 +19,13 @@ STAGE_NAME = "$default"
 PAYLOAD_FORMAT_VERSION = "2.0"
 PERMISSION_STATEMENT_ID = "mercato-api-invoke"
 
+# Every request costs a Bedrock turn and possibly a Tavily search, so an
+# unthrottled endpoint lets a single caller — even a legitimately authorized one
+# stuck in a retry loop — run up a real bill. These are deliberately low; raise
+# them if genuine traffic ever warrants it.
+THROTTLE_BURST_LIMIT = 10
+THROTTLE_RATE_LIMIT = 5
+
 # AWS_IAM means every request must be SigV4-signed, and the signing principal must
 # hold execute-api:Invoke on this route's ARN (arn:aws:execute-api:{region}:{account
 # id}:{api_id}/*/*{ROUTE_PATH}). API Gateway rejects unsigned requests with a plain
@@ -96,45 +103,105 @@ def create_or_get_integration(apigateway, api_id: str, function_arn: str) -> str
 
 
 def create_or_get_route(apigateway, api_id: str, integration_id: str) -> None:
+    target = f"integrations/{integration_id}"
+
     existing = apigateway.get_routes(ApiId=api_id)["Items"]
     for route in existing:
-        if route["RouteKey"] == ROUTE_KEY:
-            if route.get("AuthorizationType") == AUTHORIZATION_TYPE:
-                console.print(f"[yellow]![/yellow] Route '{ROUTE_KEY}' already exists with {AUTHORIZATION_TYPE} auth — reusing it")
-                return
+        if route["RouteKey"] != ROUTE_KEY:
+            continue
 
-            apigateway.update_route(
-                ApiId=api_id,
-                RouteId=route["RouteId"],
-                AuthorizationType=AUTHORIZATION_TYPE,
-            )
+        # The route and the integration are reused independently — the route is
+        # matched on RouteKey, the integration on IntegrationUri. So if the Lambda
+        # ARN ever changes, a re-run creates a fresh integration while this route
+        # keeps pointing at the old integration id, leaving the API silently wired
+        # to stale (or deleted) infrastructure. Reconcile the target explicitly.
+        stale_target = route.get("Target") != target
+        stale_auth = route.get("AuthorizationType") != AUTHORIZATION_TYPE
+
+        if not stale_target and not stale_auth:
             console.print(
-                f"[green]✔[/green] Route '{ROUTE_KEY}' existed with authorization "
-                f"'{route.get('AuthorizationType')}' — updated it to {AUTHORIZATION_TYPE}"
+                f"[yellow]![/yellow] Route '{ROUTE_KEY}' already exists with "
+                f"{AUTHORIZATION_TYPE} auth and the current integration — reusing it"
             )
             return
+
+        updates = {}
+        if stale_target:
+            updates["Target"] = target
+        if stale_auth:
+            updates["AuthorizationType"] = AUTHORIZATION_TYPE
+
+        apigateway.update_route(ApiId=api_id, RouteId=route["RouteId"], **updates)
+
+        if stale_target:
+            console.print(
+                f"[green]✔[/green] Route '{ROUTE_KEY}' pointed at a stale integration "
+                f"('{route.get('Target')}') — repointed it at '{target}'"
+            )
+        if stale_auth:
+            console.print(
+                f"[green]✔[/green] Route '{ROUTE_KEY}' had authorization "
+                f"'{route.get('AuthorizationType')}' — updated it to {AUTHORIZATION_TYPE}"
+            )
+        return
 
     apigateway.create_route(
         ApiId=api_id,
         RouteKey=ROUTE_KEY,
-        Target=f"integrations/{integration_id}",
+        Target=target,
         AuthorizationType=AUTHORIZATION_TYPE,
     )
     console.print(f"[green]✔[/green] Created route '{ROUTE_KEY}' with {AUTHORIZATION_TYPE} authorization")
 
 
 def create_or_get_stage(apigateway, api_id: str) -> None:
+    throttle_settings = {
+        "ThrottlingBurstLimit": THROTTLE_BURST_LIMIT,
+        "ThrottlingRateLimit": THROTTLE_RATE_LIMIT,
+    }
+
     try:
-        apigateway.get_stage(ApiId=api_id, StageName=STAGE_NAME)
+        stage = apigateway.get_stage(ApiId=api_id, StageName=STAGE_NAME)
         console.print(f"[yellow]![/yellow] Stage '{STAGE_NAME}' already exists — reusing it")
+
+        # An existing stage predating this script has no throttle at all, so
+        # reconcile its limits rather than assuming creation set them.
+        current = stage.get("DefaultRouteSettings", {})
+        if (
+            current.get("ThrottlingBurstLimit") == THROTTLE_BURST_LIMIT
+            and current.get("ThrottlingRateLimit") == THROTTLE_RATE_LIMIT
+        ):
+            console.print(
+                f"[yellow]![/yellow] Throttle already set to {THROTTLE_RATE_LIMIT} req/s "
+                f"(burst {THROTTLE_BURST_LIMIT}) — skipping"
+            )
+            return
+
+        apigateway.update_stage(
+            ApiId=api_id,
+            StageName=STAGE_NAME,
+            DefaultRouteSettings=throttle_settings,
+        )
+        console.print(
+            f"[green]✔[/green] Applied throttle to '{STAGE_NAME}': {THROTTLE_RATE_LIMIT} req/s "
+            f"steady-state, {THROTTLE_BURST_LIMIT} burst"
+        )
         return
     except ClientError as e:
         if e.response["Error"]["Code"] != "NotFoundException":
             console.print(f"[red]✘[/red] Failed to check stage '{STAGE_NAME}': {e}")
             sys.exit(1)
 
-    apigateway.create_stage(ApiId=api_id, StageName=STAGE_NAME, AutoDeploy=True)
-    console.print(f"[green]✔[/green] Created stage '{STAGE_NAME}' with auto-deploy enabled")
+    apigateway.create_stage(
+        ApiId=api_id,
+        StageName=STAGE_NAME,
+        AutoDeploy=True,
+        DefaultRouteSettings=throttle_settings,
+    )
+    console.print(
+        f"[green]✔[/green] Created stage '{STAGE_NAME}' with auto-deploy and a throttle of "
+        f"{THROTTLE_RATE_LIMIT} req/s steady-state, {THROTTLE_BURST_LIMIT} burst"
+    )
 
 
 def add_invoke_permission(lambda_client, api_id: str, region: str, account_id: str) -> None:
