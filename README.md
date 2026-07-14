@@ -467,9 +467,7 @@ mercato/
 
 ## License
 
-MIT.
-
-> **Note:** a `LICENSE` file has not been added to this repository yet. Add one before treating the above as legally operative.
+MIT — see [LICENSE](LICENSE).
 
 ---
 
