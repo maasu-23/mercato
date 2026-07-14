@@ -2,7 +2,7 @@ import hashlib
 import json
 import traceback
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from agent.agent import chat
 
@@ -14,8 +14,17 @@ def _deserialize_history(history: list) -> list:
         content = entry.get("content", "")
         if role == "human":
             messages.append(HumanMessage(content=content))
-        else:
+        elif role == "tool":
+            # Serialized history doesn't carry the original tool_call_id, so this
+            # round-trip is lossy — a placeholder is used since LangChain requires
+            # the field but nothing downstream matches on its value here.
+            messages.append(ToolMessage(content=content, tool_call_id="unknown"))
+        elif role in ("ai", "assistant"):
             messages.append(AIMessage(content=content))
+        else:
+            # Unexpected/unknown role — fall back to treating it as a human turn
+            # rather than silently mislabeling it as assistant output.
+            messages.append(HumanMessage(content=content))
     return messages
 
 
