@@ -340,7 +340,27 @@ python infra/deploy_lambda.py          # uploads to S3, updates the Lambda funct
 python infra/setup_api_gateway.py      # creates the HTTP API, route, stage, and invoke permission
 ```
 
-`infra/build_lambda_package.py` pins pip to `manylinux2014_x86_64` wheels for CPython 3.11 — without that, packages with compiled extensions (pydantic-core, numpy) build for your host platform and fail to import inside Lambda. The resulting package exceeds Lambda's 50 MB direct-upload limit, which is why `deploy_lambda.py` stages it through S3 rather than uploading it inline. `infra/lambda_handler.py` is the API Gateway entry point, and `infra/setup_api_gateway.py` is idempotent — re-running it reuses the existing API rather than creating a duplicate.
+`infra/build_lambda_package.py` pins pip to `manylinux2014_x86_64` wheels for CPython 3.11 — without that, packages with compiled extensions (pydantic-core, numpy) build for your host platform and fail to import inside Lambda. The resulting package exceeds Lambda's 50 MB direct-upload limit, which is why `deploy_lambda.py` stages it through S3 rather than uploading it inline. `infra/lambda_handler.py` is the API Gateway entry point, and `infra/setup_api_gateway.py` is idempotent — re-running it reuses the existing API (and upgrades the route to `AWS_IAM` authorization if an older run left it as `NONE`) rather than creating a duplicate.
+
+### Calling the deployed endpoint
+
+The `/chat` route requires `AWS_IAM` authorization: every request must be **SigV4-signed**, and the signing principal must hold `execute-api:Invoke` on the route's ARN. Unsigned requests (plain `curl`/`httpx`) get a 403 from API Gateway before the Lambda ever runs. `user_id` is derived server-side from the signer's verified IAM ARN — hashed the same way `cli/main.py` does locally — so it can't be set or spoofed via the request body.
+
+To sign requests, use `botocore`'s `SigV4Auth` (or an equivalent, like `requests-aws4auth`/`aws-requests-auth`, or a CLI tool such as `awscurl`) with credentials from the identity you intend to authenticate as. Grant that identity this policy, replacing `REGION`, `ACCOUNT_ID`, and `API_ID` with your deployment's values (`API_ID` is printed by `infra/setup_api_gateway.py`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "MercatoInvokeChat",
+      "Effect": "Allow",
+      "Action": "execute-api:Invoke",
+      "Resource": "arn:aws:execute-api:REGION:ACCOUNT_ID:API_ID/*/*/chat"
+    }
+  ]
+}
+```
 
 > **🚧 Roadmap — not yet implemented.** The intent is for the CLI to optionally talk to a deployed endpoint by setting `API_GATEWAY_URL` in `.env`, instead of calling the agent in-process. **This is not wired into `cli/main.py` yet.** Today the CLI always runs the agent locally, and the deployed Lambda is reachable only by calling its endpoint directly. Treat the deployment scripts as infrastructure that works, and the CLI integration as future work.
 
@@ -381,7 +401,7 @@ Being straightforward about what this does and doesn't do:
 
 - **UCP is an emerging protocol.** The public UCP endpoint may not resolve, and coverage across merchants is incomplete. In practice the agent frequently falls back to web search. This is handled gracefully — `ucp_query` returns an error dict rather than raising, and the agent moves on to `web_search` without the user noticing — but it means the "structured, purchase-ready data" path is aspirational more often than it's exercised.
 - **Web-search prices are read from snippets, not extracted.** Tavily returns page text, not structured price fields. The model reads prices out of that text, which is usually right but is not a guarantee. Verify before you buy.
-- **No authentication on the deployed API.** If you deploy to API Gateway, the `/chat` route has no authorizer — anyone with the URL can invoke it, and every call spends *your* Bedrock and Tavily budget. This is intended for local use with your own AWS credentials, not public hosting. Add a JWT authorizer or an API key before exposing it.
+- **The deployed API requires SigV4-signed requests.** The `/chat` route uses `AWS_IAM` authorization — API Gateway rejects any unsigned request with a 403 before it reaches the Lambda. Callers need `execute-api:Invoke` permission on the route (see [Deploying to Lambda + API Gateway](#deploying-to-lambda--api-gateway-optional)), and `user_id` is derived server-side from the signer's verified IAM ARN, never trusted from the request body. This still isn't meant for public/anonymous hosting — every signed call still spends *your* Bedrock and Tavily budget — but it does mean the endpoint can't be invoked, or have its data read or written, by an arbitrary caller with just the URL.
 - **This is a portfolio and learning project, not a production shopping platform.** No rate limiting, no cost controls, no retry/backoff on tool failures, no evaluation harness. It's built to demonstrate an agentic architecture on AWS, and it's honest about being that.
 
 ---
