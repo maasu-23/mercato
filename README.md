@@ -197,7 +197,7 @@ python infra/setup.py          # creates DynamoDB tables + S3 bucket, verifies B
 python -m cli.main             # start chatting
 ```
 
-> **Note on `S3_BUCKET_NAME`:** S3 bucket names are globally unique across all AWS accounts. The value shipped in `.env.example` is already taken — change it to something of your own before running `infra/setup.py`.
+> **Note on `S3_BUCKET_NAME`:** S3 bucket names are globally unique across all AWS accounts. The value shipped in `.env.example` is a placeholder — change it to something globally unique of your own before running `infra/setup.py`.
 
 > **⚠️ Bedrock model access is a one-time manual step.** Before Claude will respond, you must submit Anthropic's **use case details** form in the AWS Bedrock console under **Model access**. Approval is automatic but can take **up to 15 minutes to propagate**. Until it does, every invocation fails with `ResourceNotFoundException` — see [Troubleshooting](#troubleshooting).
 
