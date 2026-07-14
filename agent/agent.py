@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timezone
 
 import boto3
-from langchain_aws import ChatBedrock
+from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -12,7 +12,7 @@ from agent.state import AgentState
 from agent.tools import ALL_TOOLS
 
 DEFAULT_REGION = "ap-south-1"
-DEFAULT_MODEL_ID = "anthropic.claude-sonnet-4-5"
+DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 AWS_REGION = os.getenv("AWS_REGION", DEFAULT_REGION)
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "")
@@ -41,12 +41,13 @@ use get_wishlist. To buy or open a product, use checkout_url."""
 _graph = None
 
 
-def _build_llm() -> ChatBedrock:
-    """Construct the ChatBedrock LLM from configuration."""
-    return ChatBedrock(
-        model_id=BEDROCK_MODEL_ID,
+def _build_llm() -> ChatBedrockConverse:
+    """Construct the ChatBedrockConverse LLM from configuration."""
+    return ChatBedrockConverse(
+        model=BEDROCK_MODEL_ID,
         region_name=AWS_REGION,
-        model_kwargs={"max_tokens": 2048, "temperature": 0.2},
+        max_tokens=2048,
+        temperature=0.2,
     )
 
 
