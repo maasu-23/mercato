@@ -460,7 +460,7 @@ mercato/
 ├── agent/
 │   ├── __init__.py
 │   ├── agent.py                   # LangGraph loop, Bedrock LLM, chat() entry point
-│   ├── state.py                   # AgentState TypedDict (messages, user_id, last_results)
+│   ├── state.py                   # AgentState TypedDict (messages, user_id)
 │   └── tools/
 │       ├── __init__.py            # ALL_TOOLS — the tool registry bound to the model
 │       ├── ucp_query.py           # UCP merchant search

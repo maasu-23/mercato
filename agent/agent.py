@@ -84,7 +84,6 @@ def build_graph():
         return {
             "messages": [response],
             "user_id": state["user_id"],
-            "last_results": state["last_results"],
         }
 
     tool_node = ToolNode(ALL_TOOLS)
@@ -121,9 +120,7 @@ def chat(user_message: str, history: list, user_id: str) -> tuple[str, list]:
     """
     history = history + [HumanMessage(content=user_message)]
 
-    result = get_graph().invoke(
-        {"messages": history, "user_id": user_id, "last_results": []}
-    )
+    result = get_graph().invoke({"messages": history, "user_id": user_id})
 
     updated_messages = result["messages"]
     reply = str(updated_messages[-1].content)

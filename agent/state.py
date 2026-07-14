@@ -15,10 +15,7 @@ class AgentState(TypedDict):
         user_id: The hashed IAM ARN identifying the current user. Set once at
             startup and passed into every tool that writes to DynamoDB so reads
             and writes are scoped to this user.
-        last_results: The most recent set of product results. Cached here so
-            price_compare can reference the last search without re-querying.
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
     user_id: str
-    last_results: list[dict]
