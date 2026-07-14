@@ -1,9 +1,13 @@
 import json
 import os
 from datetime import datetime, timezone
+from typing import Annotated
 
 import boto3
 from langchain_core.tools import tool
+from langgraph.prebuilt import InjectedState
+
+from agent.state import AgentState
 
 DEFAULT_REGION = "ap-south-1"
 
@@ -30,7 +34,11 @@ def _to_float(value) -> float | None:
 
 
 @tool
-def price_compare(products: list[dict], query: str = "", user_id: str = "") -> dict:
+def price_compare(
+    products: list[dict],
+    state: Annotated[AgentState, InjectedState],
+    query: str = "",
+) -> dict:
     """Rank products by price and save a comparison snapshot to S3.
 
     Ranks the given products cheapest first, flags the single best deal, and
@@ -47,9 +55,6 @@ def price_compare(products: list[dict], query: str = "", user_id: str = "") -> d
             Dicts with an "error" key are ignored.
         query: Optional original search query, stored in the S3 artifact for
             context.
-        user_id: Optional hashed IAM ARN of the current user. Required (together
-            with a configured S3_BUCKET_NAME) for the comparison to be saved to
-            S3; if either is missing, saving is skipped silently.
 
     Returns:
         A dict with keys:
@@ -60,6 +65,8 @@ def price_compare(products: list[dict], query: str = "", user_id: str = "") -> d
             s3_artifact: The "s3://..." path of the saved artifact, or None if
                 nothing was saved.
     """
+    user_id = (state or {}).get("user_id", "")
+
     real_products = [p for p in products if "error" not in p]
 
     priced = []
