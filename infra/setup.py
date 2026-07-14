@@ -115,7 +115,7 @@ def verify_bedrock_access(bedrock, model_id: str) -> None:
     try:
         response = bedrock.list_foundation_models()
         model_ids = [m["modelId"] for m in response.get("modelSummaries", [])]
-        match = any("claude-sonnet-4-5" in m for m in model_ids)
+        match = any("claude-sonnet-4-5-20250929-v1:0" in m for m in model_ids)
         if match:
             console.print("[green]✔[/green] Bedrock access verified — claude-sonnet-4-5 is available in this region")
         else:
