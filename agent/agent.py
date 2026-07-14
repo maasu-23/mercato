@@ -13,6 +13,7 @@ from agent.tools import ALL_TOOLS
 
 DEFAULT_REGION = "ap-south-1"
 DEFAULT_MODEL_ID = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+MAX_HISTORY_MESSAGES = 20
 
 AWS_REGION = os.getenv("AWS_REGION", DEFAULT_REGION)
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "")
@@ -119,6 +120,11 @@ def chat(user_message: str, history: list, user_id: str) -> tuple[str, list]:
         A tuple of (reply text, updated message list).
     """
     history = history + [HumanMessage(content=user_message)]
+
+    # Cap what gets resent to Bedrock each turn — history accumulates full tool
+    # outputs (search/UCP results, ranked comparisons) and grows unbounded over
+    # a long session, inflating both token cost and context window usage.
+    history = history[-MAX_HISTORY_MESSAGES:]
 
     result = get_graph().invoke({"messages": history, "user_id": user_id})
 
