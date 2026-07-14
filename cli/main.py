@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from agent.agent import chat
-from agent.tools import get_wishlist
+from agent.tools.wishlist import fetch_wishlist
 
 console = Console()
 
@@ -49,7 +49,7 @@ def _print_welcome() -> None:
 def _print_wishlist(user_id: str) -> None:
     """Fetch and render the user's wishlist, bypassing the agent loop."""
     try:
-        items = get_wishlist.invoke({"user_id": user_id})
+        items = fetch_wishlist(user_id)
     except Exception as e:
         console.print(f"[red]Could not load your wishlist:[/red] {e}")
         return
