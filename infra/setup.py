@@ -1,4 +1,5 @@
 import os
+import sys
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -30,6 +31,7 @@ def get_clients(region: str) -> dict:
         "dynamodb": boto3.client("dynamodb", region_name=region),
         "s3": boto3.client("s3", region_name=region),
         "bedrock": boto3.client("bedrock", region_name=region),
+        "bedrock_runtime": boto3.client("bedrock-runtime", region_name=region),
     }
 
 
@@ -111,7 +113,7 @@ def create_s3_bucket(s3, bucket_name: str, region: str) -> None:
     block_public_access(s3, bucket_name)
 
 
-def verify_bedrock_access(bedrock, model_id: str) -> None:
+def verify_bedrock_access(bedrock, bedrock_runtime, model_id: str) -> None:
     try:
         response = bedrock.list_foundation_models()
         model_ids = [m["modelId"] for m in response.get("modelSummaries", [])]
@@ -127,6 +129,26 @@ def verify_bedrock_access(bedrock, model_id: str) -> None:
         console.print("[red]✘[/red] No AWS credentials found. Run 'aws configure' first.")
     except ClientError as e:
         console.print(f"[red]✘[/red] Failed to verify Bedrock access: {e}")
+
+    try:
+        bedrock_runtime.converse(
+            modelId=model_id,
+            messages=[{"role": "user", "content": [{"text": "hi"}]}],
+            inferenceConfig={"maxTokens": 10},
+        )
+        console.print("[green]✔[/green] Bedrock invocation verified — account can use claude-sonnet-4-5")
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        error_message = e.response["Error"]["Message"]
+        if error_code == "ResourceNotFoundException" and "use case details" in error_message:
+            console.print(
+                "[yellow]![/yellow] Bedrock invocation blocked — submit the Anthropic use case form in the "
+                "Bedrock console under Model access. This can take up to 15 minutes to propagate."
+            )
+        else:
+            console.print(f"[red]✘[/red] Bedrock invocation failed: {error_message}")
+    except Exception as e:
+        console.print(f"[red]✘[/red] Bedrock invocation failed: {e}")
 
 
 def verify_tavily_key(tavily_api_key: str) -> None:
@@ -145,11 +167,20 @@ def print_iam_permissions() -> None:
     table.add_row("s3:CreateBucket", "Create the session logs / artifacts bucket")
     table.add_row("s3:PutBucketPublicAccessBlock", "Lock the bucket down from public access")
     table.add_row("bedrock:ListFoundationModels", "Verify Claude Sonnet 4.5 is available")
+    table.add_row(
+        "bedrock:InvokeModel / bedrock-runtime:Converse",
+        "Verify the account can actually invoke Claude Sonnet 4.5 (not just list it)",
+    )
 
     console.print(table)
 
 
 def main() -> None:
+    # Windows defaults stdout to cp1252, which cannot encode the glyphs below.
+    # Without this, setup crashes mid-run and leaves infrastructure half-created.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     config = load_config()
     clients = get_clients(config["region"])
 
@@ -164,7 +195,7 @@ def main() -> None:
     create_s3_bucket(clients["s3"], config["bucket_name"], config["region"])
 
     console.rule("Bedrock")
-    verify_bedrock_access(clients["bedrock"], config["bedrock_model_id"])
+    verify_bedrock_access(clients["bedrock"], clients["bedrock_runtime"], config["bedrock_model_id"])
 
     console.rule("Tavily")
     verify_tavily_key(config["tavily_api_key"])
