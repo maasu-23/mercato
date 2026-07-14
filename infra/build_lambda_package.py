@@ -21,6 +21,19 @@ RUNTIME_DEPENDENCIES = [
     "httpx==0.27.0",
 ]
 
+# Lambda runs Linux/x86_64 on CPython 3.11. Without these, pip resolves wheels for
+# whatever machine runs this build, and packages with compiled extensions
+# (pydantic-core, numpy, orjson, tiktoken) fail to import inside Lambda.
+LAMBDA_PLATFORM_ARGS = [
+    "--platform",
+    "manylinux2014_x86_64",
+    "--python-version",
+    "3.11",
+    "--implementation",
+    "cp",
+    "--only-binary=:all:",
+]
+
 
 def clean_build_dir() -> None:
     if BUILD_DIR.exists():
@@ -39,6 +52,7 @@ def install_dependencies() -> None:
             "install",
             "--target",
             str(PACKAGE_DIR),
+            *LAMBDA_PLATFORM_ARGS,
             *RUNTIME_DEPENDENCIES,
         ],
         check=True,
