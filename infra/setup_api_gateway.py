@@ -19,6 +19,15 @@ STAGE_NAME = "$default"
 PAYLOAD_FORMAT_VERSION = "2.0"
 PERMISSION_STATEMENT_ID = "mercato-api-invoke"
 
+# AWS_IAM means every request must be SigV4-signed, and the signing principal must
+# hold execute-api:Invoke on this route's ARN (arn:aws:execute-api:{region}:{account
+# id}:{api_id}/*/*{ROUTE_PATH}). API Gateway rejects unsigned requests with a plain
+# 403 before they ever reach the Lambda. Callers can sign requests with boto3's
+# botocore.auth.SigV4Auth (or a botocore Session's request signer), the
+# `requests`-compatible `requests-aws4auth` / `aws-requests-auth` libraries, or a
+# CLI tool like awscurl — plain `curl`/`httpx` calls with no signature will not work.
+AUTHORIZATION_TYPE = "AWS_IAM"
+
 
 def load_config() -> dict:
     load_dotenv()
@@ -90,15 +99,28 @@ def create_or_get_route(apigateway, api_id: str, integration_id: str) -> None:
     existing = apigateway.get_routes(ApiId=api_id)["Items"]
     for route in existing:
         if route["RouteKey"] == ROUTE_KEY:
-            console.print(f"[yellow]![/yellow] Route '{ROUTE_KEY}' already exists — reusing it")
+            if route.get("AuthorizationType") == AUTHORIZATION_TYPE:
+                console.print(f"[yellow]![/yellow] Route '{ROUTE_KEY}' already exists with {AUTHORIZATION_TYPE} auth — reusing it")
+                return
+
+            apigateway.update_route(
+                ApiId=api_id,
+                RouteId=route["RouteId"],
+                AuthorizationType=AUTHORIZATION_TYPE,
+            )
+            console.print(
+                f"[green]✔[/green] Route '{ROUTE_KEY}' existed with authorization "
+                f"'{route.get('AuthorizationType')}' — updated it to {AUTHORIZATION_TYPE}"
+            )
             return
 
     apigateway.create_route(
         ApiId=api_id,
         RouteKey=ROUTE_KEY,
         Target=f"integrations/{integration_id}",
+        AuthorizationType=AUTHORIZATION_TYPE,
     )
-    console.print(f"[green]✔[/green] Created route '{ROUTE_KEY}'")
+    console.print(f"[green]✔[/green] Created route '{ROUTE_KEY}' with {AUTHORIZATION_TYPE} authorization")
 
 
 def create_or_get_stage(apigateway, api_id: str) -> None:
@@ -148,7 +170,9 @@ def print_invoke_url(api_endpoint: str) -> None:
         )
     )
     console.print(
-        "[dim]This route is public — anyone with the URL can invoke the agent.[/dim]"
+        "[dim]This route requires AWS_IAM authorization — requests must be SigV4-signed "
+        "by a principal with execute-api:Invoke on this route, or API Gateway rejects "
+        "them with 403 before the Lambda ever runs.[/dim]"
     )
 
 
