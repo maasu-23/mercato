@@ -55,6 +55,9 @@ def fetch_wishlist(user_id: str) -> list[dict]:
     CLI can read the wishlist directly, without constructing agent state or
     spending a model turn.
 
+    Returns whole items as stored, so an item saved with a price alert carries
+    its "alert_threshold" back; items saved without one simply lack the key.
+
     Unlike the tools, this returns a bare list and lets DynamoDB errors propagate:
     it is not LLM-facing, so the error-dict convention buys nothing here, and its
     only caller (cli/main.py) already handles the exception and renders the list.
@@ -74,6 +77,7 @@ def save_wishlist(
     price: float | None = None,
     merchant: str = "",
     currency: str = "INR",
+    alert_threshold: float | None = None,
 ) -> dict:
     """Save a product to the current user's wishlist.
 
@@ -87,6 +91,12 @@ def save_wishlist(
         price: Optional product price.
         merchant: Optional selling merchant name.
         currency: Price currency (default "INR").
+        alert_threshold: Optional price alert. When set, the user wants to be
+            notified once the product's price drops to or below this value.
+            Nothing in this module acts on it — the comparison is the job of a
+            separate scheduled process that is not built yet; save_wishlist only
+            records the user's intent. Omitted entirely from the stored item when
+            not provided, so items without an alert carry no empty field.
 
     Returns:
         A dict. On success:
@@ -113,6 +123,9 @@ def save_wishlist(
     # DynamoDB's Python SDK cannot serialize native floats, so store price as a str.
     if price is not None:
         item["price"] = str(price)
+    # Same float restriction applies to the alert threshold.
+    if alert_threshold is not None:
+        item["alert_threshold"] = str(alert_threshold)
 
     try:
         _get_table().put_item(Item=item)
@@ -132,7 +145,10 @@ def get_wishlist(state: Annotated[AgentState, InjectedState]) -> dict:
     Returns:
         A dict. On success:
             {"items": [...]} — the wishlist item dicts, newest first. An empty
-            list means the wishlist is empty, which is not an error.
+            list means the wishlist is empty, which is not an error. An item may
+            optionally include "alert_threshold": the price the user asked to be
+            alerted at when they saved it. Items saved without an alert omit the
+            key entirely.
         On failure — the session carries no user identity, or the DynamoDB read
         fails — a dict with an "error" key describing what went wrong. Never
         raises for these expected failures.

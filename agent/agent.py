@@ -37,7 +37,12 @@ titles, prices, merchants, and URLs must come from tool output.
 - The default currency is INR unless the user explicitly specifies another.
 
 When the user wants to save an item, use save_wishlist. To review saved items, \
-use get_wishlist. To buy or open a product, use checkout_url."""
+use get_wishlist. To buy or open a product, use checkout_url.
+
+When a user asks to save an item AND names a price they want to be alerted at \
+(e.g. "save this and let me know if it drops below 10000"), pass that number to \
+save_wishlist as alert_threshold. Only set it when the user actually asks for an \
+alert — never infer one from the current price."""
 
 _graph = None
 
