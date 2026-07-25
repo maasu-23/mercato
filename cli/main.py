@@ -4,7 +4,9 @@ import sys
 import click
 from dotenv import load_dotenv
 
-load_dotenv()
+# override=True so .env wins over anything already exported in the shell —
+# otherwise an inherited AWS_REGION points the CLI at a region with no tables.
+load_dotenv(override=True)
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError

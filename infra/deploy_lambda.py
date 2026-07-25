@@ -53,7 +53,10 @@ ROLE_PROPAGATION_DELAY = 5
 
 
 def load_config() -> dict:
-    load_dotenv()
+    # override=True so .env wins over anything already exported in the shell.
+    # Without it an inherited AWS_REGION silently beats the .env value and the
+    # function gets deployed to a region the rest of the stack is not in.
+    load_dotenv(override=True)
     return {
         "region": os.getenv("AWS_REGION", DEFAULT_REGION),
         "bucket_name": os.getenv("S3_BUCKET_NAME", ""),

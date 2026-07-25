@@ -37,7 +37,10 @@ AUTHORIZATION_TYPE = "AWS_IAM"
 
 
 def load_config() -> dict:
-    load_dotenv()
+    # override=True so .env wins over anything already exported in the shell.
+    # Without it an inherited AWS_REGION silently beats the .env value and the
+    # API gets created in a region the rest of the stack is not in.
+    load_dotenv(override=True)
     return {"region": os.getenv("AWS_REGION", DEFAULT_REGION)}
 
 
