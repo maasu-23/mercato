@@ -4,9 +4,11 @@ Scans the wishlist table for items carrying an alert_threshold (written by
 save_wishlist), asks the agent what each one currently costs, and reports the
 ones that have dropped to or below their threshold.
 
-Nothing is sent to the user yet — triggered alerts are printed to CloudWatch and
-returned in the response. SNS publishing is the next step, deliberately left out
-until this logic has been verified against real data.
+Notifications are live when SNS_TOPIC_ARN is configured: each triggered alert is
+published to that topic, which fans out to whatever is subscribed (ALERT_EMAIL,
+typically). With SNS_TOPIC_ARN unset the run still happens end to end but sends
+nothing, so an unconfigured environment is safe to invoke — triggered alerts are
+printed to CloudWatch and returned in the response either way.
 
 A triggered alert is consumed: its alert_threshold is removed from the item so
 the same price drop is not reported on every subsequent run.
@@ -25,6 +27,10 @@ import boto3
 DEFAULT_REGION = "ap-south-1"
 DEFAULT_WISHLIST_TABLE = "mercato-wishlist"
 
+SUBJECT_PREFIX = "Mercato Price Alert: "
+# SNS requires a Subject of ASCII text under 100 characters with no line breaks.
+MAX_SUBJECT_LENGTH = 99
+
 PRICE_PROMPT = (
     "What is the current price of this exact product?\n\n"
     "{product}\n\n"
@@ -42,6 +48,9 @@ def _config() -> dict:
     return {
         "region": os.getenv("AWS_REGION", DEFAULT_REGION),
         "wishlist_table": os.getenv("DYNAMODB_WISHLIST_TABLE", DEFAULT_WISHLIST_TABLE),
+        # No default: an empty topic ARN is the signal to skip publishing, and a
+        # made-up default would only turn that into a runtime failure.
+        "sns_topic_arn": os.getenv("SNS_TOPIC_ARN", ""),
     }
 
 
@@ -83,6 +92,84 @@ def _product_description(title: str, url: str = "", merchant: str = "") -> str:
     if merchant:
         lines.append(f"Merchant: {merchant}")
     return "\n".join(lines)
+
+
+def _alert_subject(title: str) -> str:
+    """Build the SNS Subject line for an alert, trimmed to what SNS will accept.
+
+    A product title is arbitrary text pulled off a merchant page, but SNS rejects
+    a Subject that runs past 100 characters, breaks a line, or carries non-ASCII —
+    so an em dash or a long title would fail the publish outright rather than just
+    read badly. Whitespace is collapsed, non-ASCII dropped, and the result cut to
+    length.
+    """
+    flattened = " ".join(str(title).split())
+    ascii_only = flattened.encode("ascii", "ignore").decode("ascii").strip()
+    subject = f"{SUBJECT_PREFIX}{ascii_only}" if ascii_only else "Mercato Price Alert"
+
+    if len(subject) > MAX_SUBJECT_LENGTH:
+        subject = subject[: MAX_SUBJECT_LENGTH - 3] + "..."
+    return subject
+
+
+def publish_alert(sns_client, topic_arn: str, alert: dict) -> bool:
+    """Publish one triggered alert to the SNS topic.
+
+    Args:
+        sns_client: A boto3 SNS client, created once by the caller and reused for
+            every alert in the run.
+        topic_arn: The topic to publish to. Assumed non-empty — the caller decides
+            whether notifications are configured at all.
+        alert: One result dict from check_all_alerts.
+
+    Returns:
+        True if SNS accepted the publish, False if it did not. Never raises: one
+        undeliverable alert must not abort the alerts behind it or fail the run,
+        and the alert is reported in the response regardless.
+    """
+    title = alert.get("title", "this item")
+
+    lines = [
+        f"{title} has dropped to the price you were watching for.",
+        "",
+        f"Current price: {alert.get('current_price')}",
+        f"Your alert price: {alert.get('alert_threshold')}",
+    ]
+
+    url = alert.get("url", "")
+    if url:
+        lines.extend(["", url])
+
+    if alert.get("alert_cleared"):
+        lines.extend(
+            [
+                "",
+                "This alert is now used up. Save the item again with a new alert "
+                "price to keep watching it.",
+            ]
+        )
+    else:
+        # The threshold could not be removed from the item, so the next scheduled
+        # run will find it again. Say so, rather than let a repeat notification
+        # look like a second, separate price drop.
+        lines.extend(
+            [
+                "",
+                "Note: this alert could not be cleared, so you may receive it "
+                "again on the next check.",
+            ]
+        )
+
+    try:
+        sns_client.publish(
+            TopicArn=topic_arn,
+            Subject=_alert_subject(title),
+            Message="\n".join(lines),
+        )
+        return True
+    except Exception as e:
+        print(f"[price-check] WARNING failed to publish alert for {title!r}: {e}")
+        return False
 
 
 def _clear_alert_threshold(user_id: str, product_id: str) -> bool:
@@ -289,23 +376,44 @@ def check_all_alerts(items: list[dict] | None = None) -> list[dict]:
 def handler(event, context):
     """Entry point for the scheduled price check.
 
-    Returns a 200 with the triggered alerts, or a 500 carrying the error message.
-    This runs unattended on a schedule, so failures are logged with a full
-    traceback and reported in the return value rather than passing silently.
+    Scans, prices, notifies. Returns a 200 with the triggered alerts and how many
+    of them reached SNS, or a 500 carrying the error message. This runs unattended
+    on a schedule, so failures are logged with a full traceback and reported in the
+    return value rather than passing silently.
     """
     try:
+        config = _config()
         items = scan_wishlist_for_alerts()
         results = check_all_alerts(items)
 
-        # Stand-in for notification until SNS is wired up: the triggered alerts
-        # land in CloudWatch as one JSON blob, so a run can be inspected after
-        # the fact without replaying it.
+        # Log the triggered alerts as one JSON blob regardless of whether they were
+        # published, so a run can be inspected after the fact without replaying it.
         print(f"[price-check] results: {json.dumps(results, default=str)}")
+
+        published = 0
+        topic_arn = config["sns_topic_arn"]
+
+        if not topic_arn:
+            # No topic configured: complete the run but send nothing, so an
+            # unprovisioned environment is safe to invoke. Note the alerts have
+            # already been consumed by this point — the log above is the only
+            # record of what would have gone out.
+            print(
+                "[price-check] SNS_TOPIC_ARN not set — notifications skipped, "
+                "alerts logged only"
+            )
+        elif results:
+            sns_client = boto3.client("sns", region_name=config["region"])
+            for alert in results:
+                if publish_alert(sns_client, topic_arn, alert):
+                    published += 1
+            print(f"[price-check] published {published}/{len(results)} alert(s)")
 
         return {
             "statusCode": 200,
             "checked": len(items),
             "alerts_triggered": len(results),
+            "published": published,
             "results": results,
         }
     except Exception as e:
