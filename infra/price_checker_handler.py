@@ -275,14 +275,19 @@ def get_current_price(
         print(f"[price-check] agent call failed for {title!r}: {e}")
         return None
 
+    # Both non-price outcomes below collapse to the same None the caller sees, so
+    # each logs the raw reply first — repr keeps a multi-line answer on one
+    # CloudWatch line. Without this a run that priced nothing gives no way to tell
+    # a declined lookup from a malformed one without replaying the agent call.
     cleaned = str(reply).strip()
     if cleaned.upper() == "UNKNOWN":
+        print(f"[price-check] agent returned UNKNOWN for {title!r}: {reply!r}")
         return None
 
     try:
         return float(cleaned)
     except (TypeError, ValueError):
-        print(f"[price-check] unparseable price reply for {title!r}: {cleaned!r}")
+        print(f"[price-check] unparseable price reply for {title!r}: {reply!r}")
         return None
 
 
