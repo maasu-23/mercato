@@ -213,6 +213,35 @@ def update_function_code(lambda_client, bucket_name: str) -> None:
     console.print(f"[green]✔[/green] Update submitted for '{FUNCTION_NAME}'")
 
 
+def update_function_configuration(lambda_client, role_arn: str, env_vars: dict) -> None:
+    """Reconcile an existing function's environment variables with .env.
+
+    update_function_code only pushes code — a value rotated in .env (an API key,
+    a table name) never reaches an already-existing function without this step,
+    so a redeploy after editing .env would silently report success while leaving
+    the function on stale configuration. Must follow the code update, not
+    precede it: Lambda rejects a configuration change while a code update is
+    still in progress.
+    """
+    try:
+        lambda_client.update_function_configuration(
+            FunctionName=FUNCTION_NAME,
+            Role=role_arn,
+            Handler=LAMBDA_HANDLER,
+            Runtime=LAMBDA_RUNTIME,
+            Timeout=LAMBDA_TIMEOUT,
+            MemorySize=LAMBDA_MEMORY_MB,
+            Environment={"Variables": env_vars},
+        )
+    except (ClientError, BotoCoreError) as e:
+        console.print(f"[red]✘[/red] Failed to update configuration for '{FUNCTION_NAME}': {e}")
+        sys.exit(1)
+
+    console.print(
+        f"[green]✔[/green] Configuration update submitted ({len(env_vars)} env vars)"
+    )
+
+
 def wait_for_update(lambda_client) -> dict:
     console.print("Waiting for the update to finish ...")
     try:
@@ -281,12 +310,18 @@ def main() -> None:
     )
 
     if created:
-        # CreateFunction already pulled the code we just uploaded, so there is
-        # nothing to update — only wait for the function to finish initialising.
+        # CreateFunction already pulled the code we just uploaded and applied the
+        # full configuration, so there is nothing to reconcile — only wait for the
+        # function to finish initialising.
         function_config = wait_for_active(lambda_client)
     else:
         console.rule("Update function code")
         update_function_code(lambda_client, config["bucket_name"])
+        wait_for_update(lambda_client)
+
+        console.rule("Update function configuration")
+        role_arn = ensure_execution_role(iam)
+        update_function_configuration(lambda_client, role_arn, config["env_vars"])
         function_config = wait_for_update(lambda_client)
 
     console.rule("Summary")
