@@ -207,16 +207,26 @@ def publish_alert(sns_client, topic_arn: str, alert: dict) -> bool:
     """
     title = alert.get("title", "this item")
 
+    # The Subject line needs no sanitizing of its own here: _alert_subject
+    # already flattens and ASCII-cleans it, and SNS itself rejects a malformed
+    # Subject outright. The Message body has no such backstop — SNS will
+    # happily publish any text — so title and url get the same treatment
+    # _sanitize_field already gives the pricing prompt: both are untrusted,
+    # scraped off a merchant page, and a title carrying its own blank lines
+    # could otherwise forge extra "paragraphs" into an email that genuinely
+    # comes from the user's own confirmed AWS Notifications subscription.
+    safe_title = _sanitize_field(title) or "this item"
+    safe_url = _sanitize_field(alert.get("url", ""))
+
     lines = [
-        f"{title} has dropped to the price you were watching for.",
+        f"{safe_title} has dropped to the price you were watching for.",
         "",
         f"Current price: {alert.get('current_price')}",
         f"Your alert price: {alert.get('alert_threshold')}",
     ]
 
-    url = alert.get("url", "")
-    if url:
-        lines.extend(["", url])
+    if safe_url:
+        lines.extend(["", safe_url])
 
     # Accurate as written, now that claiming precedes publishing: the threshold
     # was already removed before this call. The only path that puts it back is a
