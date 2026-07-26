@@ -78,13 +78,24 @@ def load_config() -> dict:
     load_dotenv(override=True)
     return {
         "region": os.getenv("AWS_REGION", DEFAULT_REGION),
+        # Deploy-time only: where the zip is uploaded for Lambda to pull from.
+        # Not passed to the function — the handler makes no S3 calls.
         "bucket_name": os.getenv("S3_BUCKET_NAME", ""),
+        # Exactly what price_checker_handler._config() reads, and nothing else.
+        #
+        # S3_BUCKET_NAME, DYNAMODB_SESSIONS_TABLE and TAVILY_API_KEY used to be
+        # here because the handler ran the full agent loop, which wrote session
+        # transcripts to S3 and could reach the Tavily-backed web_search tool.
+        # That loop is gone (see price_checker_handler.get_current_price), so
+        # they are dead config — and TAVILY_API_KEY is a live billable secret,
+        # readable by anyone with lambda:GetFunctionConfiguration, on a function
+        # that can no longer use it.
+        #
+        # AWS_REGION is absent because Lambda reserves it and populates it from
+        # the function's own region; see RESERVED_ENV_VARS.
         "env_vars": {
-            "S3_BUCKET_NAME": os.getenv("S3_BUCKET_NAME", ""),
             "DYNAMODB_WISHLIST_TABLE": os.getenv("DYNAMODB_WISHLIST_TABLE", "mercato-wishlist"),
-            "DYNAMODB_SESSIONS_TABLE": os.getenv("DYNAMODB_SESSIONS_TABLE", "mercato-sessions"),
             "BEDROCK_MODEL_ID": os.getenv("BEDROCK_MODEL_ID", ""),
-            "TAVILY_API_KEY": os.getenv("TAVILY_API_KEY", ""),
             "SNS_TOPIC_ARN": os.getenv("SNS_TOPIC_ARN", ""),
         },
     }

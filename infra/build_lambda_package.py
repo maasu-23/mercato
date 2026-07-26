@@ -1,9 +1,12 @@
 """Build a Lambda deployment package for one of Mercato's two functions.
 
-Both functions ship the same thing — the agent package and its dependencies —
-and differ only in which handler module sits at the package root, so they are
-built by the same code path against the BUILD_TARGETS table below rather than by
-two scripts that would drift apart the first time a dependency is bumped.
+The two functions no longer ship the same thing. The agent Lambda carries the
+whole agent package and its tool dependencies; the price checker carries a
+Bedrock client and nothing else, because it deliberately does not run the
+tool-bound agent loop (see infra/price_checker_handler.get_current_price). What
+each one gets is declared in the BUILD_TARGETS table below and built by one
+shared code path, rather than by two scripts that would drift apart the first
+time a dependency is bumped.
 
     python infra/build_lambda_package.py                # agent (default)
     python infra/build_lambda_package.py price-checker
@@ -26,16 +29,35 @@ console = Console()
 ROOT_DIR = Path(__file__).resolve().parent.parent
 BUILD_DIR = ROOT_DIR / "build"
 
-# The price checker imports agent.agent to price each item, so it needs the whole
-# agent package and every dependency the agent Lambda has. One list, both targets.
-RUNTIME_DEPENDENCIES = [
+# What both targets need to talk to Bedrock.
+#
+# langchain-core is a transitive dependency of langchain-aws, not a direct import
+# of the price checker. It is pinned here anyway so both packages resolve to the
+# same version rather than to whatever the range allows on the day.
+BEDROCK_DEPENDENCIES = [
     "boto3==1.37.0",
-    "langgraph==0.2.74",
-    "langchain-core==0.3.40",
     "langchain-aws==0.2.14",
+    "langchain-core==0.3.40",
+]
+
+# The agent Lambda adds the graph loop and the tools' own dependencies: langgraph
+# for the loop, tavily-python for web_search, httpx for ucp_query.
+AGENT_DEPENDENCIES = [
+    *BEDROCK_DEPENDENCIES,
+    "langgraph==0.2.74",
     "tavily-python==0.3.9",
     "httpx==0.27.0",
 ]
+
+# The price checker adds nothing — it imports boto3 and ChatBedrockConverse, and
+# that is the whole list. It does not import the agent package at all.
+#
+# This is a consequence of the prompt injection fix rather than an optimisation:
+# the checker feeds untrusted wishlist text to a model with no tools bound, so it
+# has no reason to carry langgraph, tavily-python or httpx. Keeping them out means
+# a future edit that reintroduces the tool loop fails at build time instead of
+# quietly restoring the vulnerability.
+PRICE_CHECKER_DEPENDENCIES = [*BEDROCK_DEPENDENCIES]
 
 # Lambda runs Linux/x86_64 on CPython 3.11. Without these, pip resolves wheels for
 # whatever machine runs this build, and packages with compiled extensions
@@ -56,12 +78,21 @@ BUILD_TARGETS = {
         "package_dir": BUILD_DIR / "lambda_package",
         "zip_path": BUILD_DIR / "mercato-lambda.zip",
         "description": "the API Gateway-fronted agent Lambda",
+        "dependencies": AGENT_DEPENDENCIES,
+        # lambda_handler.py does `from agent.agent import chat`.
+        "include_agent_package": True,
     },
     "price-checker": {
         "handler_file": "price_checker_handler.py",
         "package_dir": BUILD_DIR / "price_checker_package",
         "zip_path": BUILD_DIR / "mercato-price-checker.zip",
         "description": "the scheduled price alert Lambda",
+        "dependencies": PRICE_CHECKER_DEPENDENCIES,
+        # price_checker_handler.py imports nothing from agent/, so shipping it
+        # would put agent/tools/*.py — whose module-level imports of tavily and
+        # httpx are no longer satisfied by this package — inside the zip as dead,
+        # unimportable code. Leave it out.
+        "include_agent_package": False,
     },
 }
 
@@ -88,7 +119,8 @@ def clean_build_dir(target: dict) -> None:
 
 
 def install_dependencies(target: dict) -> None:
-    console.print(f"Installing runtime dependencies: {', '.join(RUNTIME_DEPENDENCIES)}")
+    dependencies = target["dependencies"]
+    console.print(f"Installing runtime dependencies: {', '.join(dependencies)}")
     subprocess.run(
         [
             sys.executable,
@@ -98,7 +130,7 @@ def install_dependencies(target: dict) -> None:
             "--target",
             str(target["package_dir"]),
             *LAMBDA_PLATFORM_ARGS,
-            *RUNTIME_DEPENDENCIES,
+            *dependencies,
         ],
         check=True,
     )
@@ -106,7 +138,20 @@ def install_dependencies(target: dict) -> None:
 
 
 def copy_agent_code(target: dict) -> None:
-    shutil.copytree(ROOT_DIR / "agent", target["package_dir"] / "agent")
+    """Copy agent/ into the package, for the targets whose handler imports it.
+
+    __pycache__ is excluded: it holds .pyc files compiled by whatever Python
+    built the package, which are dead weight inside a Linux Lambda runtime.
+    """
+    if not target["include_agent_package"]:
+        console.print("[dim]Skipped agent/ — this handler does not import it[/dim]")
+        return
+
+    shutil.copytree(
+        ROOT_DIR / "agent",
+        target["package_dir"] / "agent",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
     console.print("[green]✔[/green] Copied agent/ into package")
 
 
