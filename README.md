@@ -61,10 +61,12 @@ This is a learning and portfolio project, built by a 2nd-year CS student targeti
 ### 🔔 Price Drop Alerts
 
 - Saving an item can include an optional `alert_threshold` — the price you want to be told about. Items saved without one carry no alert and are never checked.
-- A scheduled Lambda (`mercato-price-checker`) runs once a day at 09:00 IST, scans the wishlist for every item carrying a threshold — across all users — and re-runs the full agent loop to find each one's current price.
+- A scheduled Lambda (`mercato-price-checker`) runs once a day at 09:00 IST and scans the wishlist for every item carrying a threshold — across all users.
+- Each one is priced by a **single direct, tool-free Bedrock call**: a bare `ChatBedrockConverse` with **no tools bound**, which estimates the price from the model's own training knowledge. It is deliberately *not* the agent loop and *not* a live search — nothing is looked up, queried, or fetched. See [Known Limitations](#known-limitations) for what that costs you in accuracy and why it is worth it anyway.
 - When that price is at or below the threshold, the alert is published to an SNS topic and delivered by email.
 - **A triggered alert is consumed.** Its `alert_threshold` is removed from the item, so one price drop notifies once rather than every morning until you notice. The item itself stays on your wishlist — save it again with a new threshold to keep watching it.
-- Pricing is deliberately strict. The agent is given the saved title, URL, and merchant together and told not to price a different variant or a different seller. If it can't identify that exact listing it declines instead of guessing, and the run logs the reply that made it decline.
+- **That removal is an atomic claim taken *before* the email is sent, not after.** It is a conditional DynamoDB update guarded on the threshold still being present, so two overlapping runs race on one write, the loser's condition fails, and exactly one of them notifies. If the publish then fails, the threshold is put back and the alert is retried on the next run. Claiming first is also what keeps a wishlist item deleted mid-run deleted, instead of letting an unconditional write resurrect it as an empty row.
+- Pricing is deliberately strict. The model is given the saved title, URL, and merchant together and told not to price a different variant or a different seller. If it can't identify that exact listing it replies `UNKNOWN` instead of guessing, and the run logs the reply that made it decline.
 
 ### 🔗 Direct Checkout Links
 
@@ -147,14 +149,18 @@ This is a learning and portfolio project, built by a 2nd-year CS student targeti
                    ┌───────────────▼──────────────┐        ┌──────────────┐
                    │  Lambda                      │  scan  │  DynamoDB    │
                    │  mercato-price-checker       │◄──────►│  mercato-    │
-                   │  (price_checker_handler.py)  │  clear │  wishlist    │
-                   │                              │  fired └──────────────┘
-                   │  for each item carrying an   │  alert
+                   │  (price_checker_handler.py)  │ claim  │  wishlist    │
+                   │                              │ /undo  └──────────────┘
+                   │  for each item carrying an   │
                    │  alert_threshold:            │
-                   │    ask the agent its price ──┼──────► LangGraph loop
-                   │    price ≤ threshold?        │        → Bedrock
+                   │    estimate its price ───────┼──────► Bedrock (Converse)
+                   │    price ≤ threshold?        │        NO tools bound —
+                   │                              │        priced from training
+                   │  then, per triggered alert:  │        knowledge, never a
+                   │    claim it, publish, and    │        live search
+                   │    restore it if that fails  │
                    └───────────────┬──────────────┘
-                                   │ publish (only when price ≤ threshold)
+                                   │ publish (only after the claim succeeds)
                    ┌───────────────▼──────────────┐
                    │  Amazon SNS                  │
                    │  mercato-price-alerts        │
@@ -423,7 +429,7 @@ python infra/deploy_price_checker.py                 # deploys the Lambda + dail
 
 `setup_price_alerts.py` creates the `mercato-price-alerts` topic and the `mercato-price-checker-role` execution role, whose entire permission set is one least-privilege inline policy it writes — scoped DynamoDB, Bedrock, SNS and CloudWatch Logs access, and no managed policies whatsoever ([full policy](#deployed-role-permissions)). A re-run also migrates a role provisioned by an older version of this script, detaching the `*FullAccess` policies it used to attach. It prints the topic ARN — copy it into `.env` as `SNS_TOPIC_ARN` before deploying, or the checker goes out in log-only mode.
 
-`deploy_price_checker.py` is re-runnable: it creates the function only when absent and otherwise reconciles both code *and* configuration, so filling in `SNS_TOPIC_ARN` afterwards and re-running is the supported way to switch a log-only deployment over to sending email. It refuses to deploy if the topic ARN's region doesn't match the function's, since a cross-region topic fails every publish. No alerts are lost when that happens — the checker claims each alert *before* sending it and restores the threshold when the send fails, so the item is retried on the next run — but nothing is ever delivered either, and the only sign is a `failed to publish` warning in CloudWatch. The region check turns a checker that silently notifies nobody into a deploy-time error.
+`deploy_price_checker.py` is re-runnable: it creates the function only when absent and otherwise reconciles both code *and* configuration, so filling in `SNS_TOPIC_ARN` afterwards and re-running is the supported way to switch a log-only deployment over to sending email. It refuses to deploy if the topic ARN's region doesn't match the function's, since a cross-region topic fails every publish. Alerts survive that, very nearly always — the checker claims each alert *before* sending it and restores the threshold when the send fails, so the item is retried on the next run ([bar the two narrow windows where the rollback itself can't run](#known-limitations)) — but nothing is ever delivered either, and the only sign is a `failed to publish` warning in CloudWatch. The region check turns a checker that silently notifies nobody into a deploy-time error.
 
 ---
 
@@ -468,9 +474,11 @@ Being straightforward about what this does and doesn't do:
 - **UCP is an emerging protocol.** The public UCP endpoint may not resolve, and coverage across merchants is incomplete. In practice the agent frequently falls back to web search. This is handled gracefully — `ucp_query` returns an error dict rather than raising, and the agent moves on to `web_search` without the user noticing — but it means the "structured, purchase-ready data" path is aspirational more often than it's exercised.
 - **Web-search prices are read from snippets, not extracted.** Tavily returns page text, not structured price fields. The model reads prices out of that text, which is usually right but is not a guarantee. Verify before you buy.
 - **The deployed API requires SigV4-signed requests.** The `/chat` route uses `AWS_IAM` authorization — API Gateway rejects any unsigned request with a 403 before it reaches the Lambda. Callers need `execute-api:Invoke` permission on the route (see [Deploying to Lambda + API Gateway](#deploying-to-lambda--api-gateway-optional)), and `user_id` is derived server-side from the signer's verified IAM ARN, never trusted from the request body. This still isn't meant for public/anonymous hosting — every signed call still spends *your* Bedrock and Tavily budget — but it does mean the endpoint can't be invoked, or have its data read or written, by an arbitrary caller with just the URL.
-- **Price alert cost scales with how many alerts exist.** Every wishlist item carrying an `alert_threshold` runs a full agent loop — several Bedrock calls, not one — once per day. Negligible for a handful of items, but the daily bill is (items with alerts) × (calls per item), so it's worth watching if alerts accumulate across users.
+- **⚠️ Price alert figures are estimates from the model's training knowledge, not a live lookup.** The price checker asks Bedrock what an item costs and takes the answer. It has no web access, no UCP query, and no tools of any kind — nothing about that call reaches the internet. Estimates are therefore bounded by the model's training cutoff and blind to current sales, regional pricing, discounts, and stock status. **Expect estimates, not quotes, and expect some alerts to fire on prices that were never real.** This is the one place in Mercato where a feature is knowingly less accurate than it could be, and it is a deliberate security tradeoff rather than an oversight: wishlist titles, URLs, and merchant names are untrusted text scraped off merchant pages and stored verbatim, and this job runs unattended on a schedule with nobody reading its output. Routing that text through the tool-bound agent — as this once did — put `web_search` (outbound egress, and therefore an exfiltration channel), `get_wishlist` / `save_wishlist`, and `checkout_url` within reach of a prompt injection carried in a product title. Answering *"what does this cost"* needs none of those, so it gets none of them, and the blast radius of a successful injection collapses to a wrong number — discarded by the parser, or at worst mis-firing one email for one item. The full reasoning is in `get_current_price`'s docstring in `infra/price_checker_handler.py`. A user-facing path, where a human reads the result and can sanity-check it, would trade the other way.
+- **Price alert cost scales with how many alerts exist.** Every wishlist item carrying an `alert_threshold` costs exactly **one** Bedrock call per day, capped at 32 output tokens — roughly an order of magnitude less than the multi-call agent loop this used to run. The daily bill is still (items with alerts) × (one call), so it's worth watching if alerts accumulate across users. The table scan is charged separately and reads the whole wishlist on every run: the `alert_threshold` filter is applied *after* the read, and there is no sparse index on it.
 - **The price check declines rather than guesses.** It prices against the saved title, URL, and merchant *together*. An item whose title contradicts its own URL — a "6GB RAM" title pointing at the 8GB listing, say — is refused rather than priced from the wrong variant, so it simply never alerts. The raw reply is logged, so the reason is visible in CloudWatch instead of surfacing as an unexplained "no price found".
-- **The checker's 300-second timeout is shared across the entire run.** Items are priced one at a time, so a large backlog of alerts can be cut short mid-batch. Anything not reached before the timeout isn't checked that day — it keeps its threshold and gets picked up on the next run.
+- **The checker's 300-second timeout is shared across the entire run.** Items are priced one at a time, so a large backlog of alerts can be cut short mid-batch. Anything not reached before the timeout isn't checked that day — it keeps its threshold and gets picked up on the next run. The one exception is an alert already claimed when the clock runs out; see below.
+- **An alert can be lost outright, rarely, in two narrow windows.** The checker claims an alert — atomically removing its `alert_threshold` — immediately *before* publishing it, and restores the threshold if that publish fails. Two paths defeat the rollback. First, the invocation can die between a successful claim and the publish: a Lambda timeout, an OOM kill, an SNS call that hangs past the remaining duration. The rollback never runs. Second, the publish can fail *and* the restoring write can fail too. Either way the alert is neither delivered nor retryable, because an item with no threshold no longer matches the scan filter — it needs setting again by hand. The second case is counted as `lost` in the response and logged as an `ERROR` carrying the item's key; the first shows up only as a run that logged an `ALERT` line and then stopped without its closing summary. The window is one item wide and normally milliseconds, but it is not zero. Closing it properly needs an in-flight marker (a `claimed_at` attribute) plus a reaper for stale claims, which is more machinery than this failure rate justifies. The previous ordering — publish first, then clear — had no such window, but paid for it with a duplicate email on every overlapping run and with phantom rows from unconditional writes; losing an alert to a crash in a millisecond-wide window is rarer than either, and unlike them it is visible in the logs when it happens.
 - **This is a portfolio and learning project, not a production shopping platform.** No rate limiting, no cost controls, no retry/backoff on tool failures, no evaluation harness. It's built to demonstrate an agentic architecture on AWS, and it's honest about being that.
 
 ---
@@ -507,14 +515,14 @@ Least privilege is **not** applied uniformly across this project, and the differ
 
 **`mercato-price-checker-role` — least privilege.** Written by `infra/setup_price_alerts.py` as a single inline policy (`mercato-price-checker-least-privilege`) that grants exactly five things, each mapping to a call the handler actually makes:
 
-- `dynamodb:Scan` and `dynamodb:UpdateItem` on the **wishlist table only** — the scan finds alert-bearing items, the update clears a consumed threshold. No `Query`, `PutItem` or `GetItem`, and no access to the sessions table.
+- `dynamodb:Scan` and `dynamodb:UpdateItem` on the **wishlist table only** — the scan finds alert-bearing items; the update does double duty, claiming a triggered alert by conditionally removing its threshold and restoring that threshold when the publish afterwards fails. Both are conditional writes, which need no permission beyond `UpdateItem`. No `Query`, `PutItem` or `GetItem`, and no access to the sessions table.
 - `bedrock:InvokeModel` scoped to **one model** — both the account's inference profile ARN and the AWS-owned foundation-model ARN behind it, since invoking through a profile authorizes against both. Not `InvokeModelWithResponseStream`: the handler calls `.invoke()`, never `.stream()`.
 - `sns:Publish` scoped to the **single** `mercato-price-alerts` topic, not every topic in the account.
-- `logs:CreateLogGroup` at the account/region level (a group can't be named before Lambda creates it), and `logs:CreateLogStream` / `logs:PutLogEvents` scoped to **this function's own log group** — narrower than `AWSLambdaBasicExecutionRole`, which leaves log writes open across every function in the account.
+- `logs:CreateLogGroup`, `logs:CreateLogStream` and `logs:PutLogEvents` all scoped to **`/aws/lambda/mercato-price-checker` and nothing else** — including the create, since CloudWatch Logs evaluates `CreateLogGroup` against the ARN of the group being created and so accepts a group that does not exist yet. `AWSLambdaBasicExecutionRole` takes an account/region wildcard for all three, leaving log access open across every function in the account.
 
 Notably absent: **S3 entirely.** Dropping the agent loop from the checker also dropped the session-transcript write, so the permission went with it.
 
-**Why this role specifically.** The price checker is the only component that feeds untrusted third-party text — product titles, URLs and merchant names scraped off merchant pages and stored verbatim — into a model, on an unattended daily schedule with no human reading the output. Prompt injection isn't reliably preventable, so the mitigation is to shrink what a successful injection can reach. Broad grants materially widen that blast radius: `AmazonS3FullAccess` reaches every bucket in the account, and `AmazonBedrockFullAccess` permits provisioned-throughput purchases. Neither is remotely close to what the code calls. This pairs with the model-side narrowing in `get_current_price`, which binds **no tools** at all — see [Price Drop Alerts](#price-drop-alerts).
+**Why this role specifically.** The price checker is the only component that feeds untrusted third-party text — product titles, URLs and merchant names scraped off merchant pages and stored verbatim — into a model, on an unattended daily schedule with no human reading the output. Prompt injection isn't reliably preventable, so the mitigation is to shrink what a successful injection can reach. Broad grants materially widen that blast radius: `AmazonS3FullAccess` reaches every bucket in the account, and `AmazonBedrockFullAccess` permits provisioned-throughput purchases. Neither is remotely close to what the code calls. This pairs with the model-side narrowing in `get_current_price`, which binds **no tools** at all — see [Price Drop Alerts](#-price-drop-alerts).
 
 **`mercato-lambda-role` — broader than ideal, knowingly.** `infra/deploy_lambda.py` attaches `AWSLambdaBasicExecutionRole`, `AmazonDynamoDBFullAccess`, `AmazonS3FullAccess` and `AmazonBedrockFullAccess`. These are account-wide wildcards: the agent Lambda can read and write **every** DynamoDB table and **every** S3 bucket in the account, not just `mercato-wishlist`, `mercato-sessions` and the artifacts bucket. The API Gateway deployment (`infra/setup_api_gateway.py`) fronts this same role.
 
@@ -551,7 +559,7 @@ The price checker's policy as actually deployed (`<region>` and `<account-id>` a
       "Sid": "CreateFunctionLogGroup",
       "Effect": "Allow",
       "Action": "logs:CreateLogGroup",
-      "Resource": "arn:aws:logs:<region>:<account-id>:*"
+      "Resource": "arn:aws:logs:<region>:<account-id>:log-group:/aws/lambda/mercato-price-checker:*"
     },
     {
       "Sid": "WriteFunctionLogs",
@@ -611,7 +619,7 @@ mercato/
 ├── infra/
 │   ├── setup.py                   # Creates DynamoDB tables + S3 bucket; verifies Bedrock & Tavily
 │   ├── lambda_handler.py          # API Gateway → Lambda entry point
-│   ├── price_checker_handler.py   # Scheduled price alerts — scan, price, publish, consume
+│   ├── price_checker_handler.py   # Scheduled price alerts — scan, price, claim, publish, restore on failure
 │   ├── build_lambda_package.py    # Builds either zip: agent (default) or price-checker
 │   ├── deploy_lambda.py           # Uploads to S3, updates the Lambda function
 │   ├── deploy_price_checker.py    # Deploys the price checker + its daily EventBridge rule

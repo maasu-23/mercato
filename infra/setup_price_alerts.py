@@ -468,19 +468,24 @@ def build_least_privilege_policy(
                 "Resource": topic_arn,
             },
             {
-                # Replaces AWSLambdaBasicExecutionRole. CreateLogGroup cannot be
-                # scoped to a single group — the group does not exist yet when
-                # Lambda creates it — so it takes the account/region wildcard that
-                # the managed policy uses too.
+                # Replaces AWSLambdaBasicExecutionRole, scoped to the one group
+                # Lambda creates for this function. CreateLogGroup *can* be
+                # scoped: CloudWatch Logs evaluates it against the ARN of the
+                # group being created, so naming a group that does not exist yet
+                # is exactly the intended use. AWSLambdaBasicExecutionRole takes
+                # an account/region wildcard here; this does not need to.
                 "Sid": "CreateFunctionLogGroup",
                 "Effect": "Allow",
                 "Action": "logs:CreateLogGroup",
-                "Resource": f"arn:aws:logs:{region}:{account_id}:*",
+                "Resource": (
+                    f"arn:aws:logs:{region}:{account_id}:log-group:"
+                    f"/aws/lambda/{FUNCTION_NAME}:*"
+                ),
             },
             {
-                # Writing, unlike creating, is scoped to this function's own log
-                # group — which is the part AWSLambdaBasicExecutionRole leaves
-                # open across every function in the account.
+                # Writing is scoped to that same single group — which is the part
+                # AWSLambdaBasicExecutionRole leaves open across every function
+                # in the account.
                 "Sid": "WriteFunctionLogs",
                 "Effect": "Allow",
                 "Action": [
