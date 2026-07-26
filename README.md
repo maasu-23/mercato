@@ -263,7 +263,9 @@ Copy `.env.example` to `.env` and fill in the following. **`.env` is gitignored 
 
 ### IAM Permissions Required
 
-The credentials you run Mercato with need the following. This is the minimal set for local use — it covers table and bucket creation (`infra/setup.py`) as well as normal agent operation.
+The credentials **you** run Mercato with locally need the following. This is the minimal set for local use — it covers table and bucket creation (`infra/setup.py`) as well as normal agent operation.
+
+This is *not* what the deployed Lambdas run as. Those use their own execution roles, scoped very differently from each other and from this policy — see [AWS IAM Best Practices](#aws-iam-best-practices). Provisioning the alerts stack additionally needs SNS, IAM role-management, Lambda and EventBridge permissions that aren't listed here.
 
 ```json
 {
@@ -419,7 +421,7 @@ python infra/deploy_price_checker.py                 # deploys the Lambda + dail
 
 > **⚠️ `setup_price_alerts.py` sends a real confirmation email, and it must be clicked.** SNS delivers nothing to an unconfirmed address. Open the message from AWS Notifications at your `ALERT_EMAIL` and click the link. Until you do, every alert publishes *successfully* and lands nowhere — which looks exactly like the checker finding no price drops. The link expires after 3 days; re-run the script to send a fresh one.
 
-`setup_price_alerts.py` creates the `mercato-price-alerts` topic and the `mercato-price-checker-role` execution role, granting it `sns:Publish` through an inline policy scoped to that one topic rather than a wildcard. It prints the topic ARN — copy it into `.env` as `SNS_TOPIC_ARN` before deploying, or the checker goes out in log-only mode.
+`setup_price_alerts.py` creates the `mercato-price-alerts` topic and the `mercato-price-checker-role` execution role, whose entire permission set is one least-privilege inline policy it writes — scoped DynamoDB, Bedrock, SNS and CloudWatch Logs access, and no managed policies whatsoever ([full policy](#deployed-role-permissions)). A re-run also migrates a role provisioned by an older version of this script, detaching the `*FullAccess` policies it used to attach. It prints the topic ARN — copy it into `.env` as `SNS_TOPIC_ARN` before deploying, or the checker goes out in log-only mode.
 
 `deploy_price_checker.py` is re-runnable: it creates the function only when absent and otherwise reconciles both code *and* configuration, so filling in `SNS_TOPIC_ARN` afterwards and re-running is the supported way to switch a log-only deployment over to sending email. It refuses to deploy if the topic ARN's region doesn't match the function's, since a cross-region topic would fail every publish *after* the alert had already been consumed.
 
@@ -491,9 +493,77 @@ Being straightforward about what this does and doesn't do:
 ### AWS IAM Best Practices
 
 - Run Mercato under a **dedicated IAM user or role**, never your root account.
-- Grant **least privilege** — the [policy above](#iam-permissions-required) is scoped to the specific tables and bucket Mercato uses, not `dynamodb:*` on `*`.
 - Scope resource ARNs explicitly. Prefer `arn:aws:dynamodb:*:*:table/mercato-wishlist` over a wildcard.
 - Rotate access keys periodically, and delete the ones you're not using.
+
+#### Deployed role permissions
+
+Least privilege is **not** applied uniformly across this project, and the difference is deliberate rather than an oversight in progress. There are two Lambda execution roles:
+
+| Role | Used by | Permissions |
+| --- | --- | --- |
+| `mercato-price-checker-role` | `mercato-price-checker` (scheduled) | One inline policy. **No managed policies at all**, including no `AWSLambdaBasicExecutionRole`. |
+| `mercato-lambda-role` | `mercato-agent` (the `/chat` API Gateway Lambda) | Four AWS-managed policies, three of them `*FullAccess`. Broader than ideal — see below. |
+
+**`mercato-price-checker-role` — least privilege.** Written by `infra/setup_price_alerts.py` as a single inline policy (`mercato-price-checker-least-privilege`) that grants exactly five things, each mapping to a call the handler actually makes:
+
+- `dynamodb:Scan` and `dynamodb:UpdateItem` on the **wishlist table only** — the scan finds alert-bearing items, the update clears a consumed threshold. No `Query`, `PutItem` or `GetItem`, and no access to the sessions table.
+- `bedrock:InvokeModel` scoped to **one model** — both the account's inference profile ARN and the AWS-owned foundation-model ARN behind it, since invoking through a profile authorizes against both. Not `InvokeModelWithResponseStream`: the handler calls `.invoke()`, never `.stream()`.
+- `sns:Publish` scoped to the **single** `mercato-price-alerts` topic, not every topic in the account.
+- `logs:CreateLogGroup` at the account/region level (a group can't be named before Lambda creates it), and `logs:CreateLogStream` / `logs:PutLogEvents` scoped to **this function's own log group** — narrower than `AWSLambdaBasicExecutionRole`, which leaves log writes open across every function in the account.
+
+Notably absent: **S3 entirely.** Dropping the agent loop from the checker also dropped the session-transcript write, so the permission went with it.
+
+**Why this role specifically.** The price checker is the only component that feeds untrusted third-party text — product titles, URLs and merchant names scraped off merchant pages and stored verbatim — into a model, on an unattended daily schedule with no human reading the output. Prompt injection isn't reliably preventable, so the mitigation is to shrink what a successful injection can reach. Broad grants materially widen that blast radius: `AmazonS3FullAccess` reaches every bucket in the account, and `AmazonBedrockFullAccess` permits provisioned-throughput purchases. Neither is remotely close to what the code calls. This pairs with the model-side narrowing in `get_current_price`, which binds **no tools** at all — see [Price Drop Alerts](#price-drop-alerts).
+
+**`mercato-lambda-role` — broader than ideal, knowingly.** `infra/deploy_lambda.py` attaches `AWSLambdaBasicExecutionRole`, `AmazonDynamoDBFullAccess`, `AmazonS3FullAccess` and `AmazonBedrockFullAccess`. These are account-wide wildcards: the agent Lambda can read and write **every** DynamoDB table and **every** S3 bucket in the account, not just `mercato-wishlist`, `mercato-sessions` and the artifacts bucket. The API Gateway deployment (`infra/setup_api_gateway.py`) fronts this same role.
+
+The tradeoff: the agent is an interactive tool with a human in the loop. Its input comes from a caller who has already authenticated with SigV4, its output is read by a person who can see when a response looks wrong, and it runs only when someone invokes it. The price checker has none of those — untrusted input, no reader, unattended schedule — which is why it got scoped down first. That is a reason for the ordering, not a justification for leaving these grants in place. **If you deploy `mercato-agent` beyond a personal project, replace these managed policies with an inline policy naming your specific tables, bucket and model**; `build_least_privilege_policy` in `infra/setup_price_alerts.py` is a working template.
+
+The price checker's policy as actually deployed (`<region>` and `<account-id>` are substituted from your environment at setup time):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WishlistTableAccess",
+      "Effect": "Allow",
+      "Action": ["dynamodb:Scan", "dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:<region>:<account-id>:table/mercato-wishlist"
+    },
+    {
+      "Sid": "InvokeBedrockModel",
+      "Effect": "Allow",
+      "Action": "bedrock:InvokeModel",
+      "Resource": [
+        "arn:aws:bedrock:<region>:<account-id>:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+      ]
+    },
+    {
+      "Sid": "PublishPriceAlerts",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:<region>:<account-id>:mercato-price-alerts"
+    },
+    {
+      "Sid": "CreateFunctionLogGroup",
+      "Effect": "Allow",
+      "Action": "logs:CreateLogGroup",
+      "Resource": "arn:aws:logs:<region>:<account-id>:*"
+    },
+    {
+      "Sid": "WriteFunctionLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:<region>:<account-id>:log-group:/aws/lambda/mercato-price-checker:*"
+    }
+  ]
+}
+```
+
+> **⚠️ The Bedrock statement is scoped to one model.** Change `BEDROCK_MODEL_ID` in `.env` without re-running `infra/setup_price_alerts.py` and the role can't invoke the new model — every item fails with `AccessDeniedException`.
 
 ### Data Protection
 
