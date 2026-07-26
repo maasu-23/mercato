@@ -58,6 +58,14 @@ This is a learning and portfolio project, built by a 2nd-year CS student targeti
 - Product IDs are derived deterministically from the product URL, so saving the same item twice updates it instead of creating a duplicate.
 - A dedicated `wishlist` command in the CLI reads your saved items directly, bypassing the agent loop entirely — no tokens spent just to look at a list.
 
+### 🔔 Price Drop Alerts
+
+- Saving an item can include an optional `alert_threshold` — the price you want to be told about. Items saved without one carry no alert and are never checked.
+- A scheduled Lambda (`mercato-price-checker`) runs once a day at 09:00 IST, scans the wishlist for every item carrying a threshold — across all users — and re-runs the full agent loop to find each one's current price.
+- When that price is at or below the threshold, the alert is published to an SNS topic and delivered by email.
+- **A triggered alert is consumed.** Its `alert_threshold` is removed from the item, so one price drop notifies once rather than every morning until you notice. The item itself stays on your wishlist — save it again with a new threshold to keep watching it.
+- Pricing is deliberately strict. The agent is given the saved title, URL, and merchant together and told not to price a different variant or a different seller. If it can't identify that exact listing it declines instead of guessing, and the run logs the reply that made it decline.
+
 ### 🔗 Direct Checkout Links
 
 - Returns the checkout link for any product and optionally opens it in your default browser.
@@ -125,6 +133,38 @@ This is a learning and portfolio project, built by a 2nd-year CS student targeti
 
   Identity: STS get_caller_identity() → SHA-256(IAM ARN)[:16] → user_id
             No Cognito. No login. No password.
+
+
+  ── Scheduled path: price alerts ──────────────────────────────────────────
+
+                   ┌──────────────────────────────┐
+                   │  Amazon EventBridge          │
+                   │  mercato-price-checker-daily │
+                   │  cron(30 3 * * ? *)          │
+                   │  = 09:00 IST, every day      │
+                   └───────────────┬──────────────┘
+                                   │ invokes
+                   ┌───────────────▼──────────────┐        ┌──────────────┐
+                   │  Lambda                      │  scan  │  DynamoDB    │
+                   │  mercato-price-checker       │◄──────►│  mercato-    │
+                   │  (price_checker_handler.py)  │  clear │  wishlist    │
+                   │                              │  fired └──────────────┘
+                   │  for each item carrying an   │  alert
+                   │  alert_threshold:            │
+                   │    ask the agent its price ──┼──────► LangGraph loop
+                   │    price ≤ threshold?        │        → Bedrock
+                   └───────────────┬──────────────┘
+                                   │ publish (only when price ≤ threshold)
+                   ┌───────────────▼──────────────┐
+                   │  Amazon SNS                  │
+                   │  mercato-price-alerts        │
+                   └───────────────┬──────────────┘
+                                   │ email fan-out
+                   ┌───────────────▼──────────────┐
+                   │  ALERT_EMAIL inbox           │
+                   │  (subscription confirmed     │
+                   │   once, by clicking a link)  │
+                   └──────────────────────────────┘
 ```
 
 ### Data Flow
@@ -148,6 +188,7 @@ This is a learning and portfolio project, built by a 2nd-year CS student targeti
 - **Amazon DynamoDB** — wishlist and session storage
 - **Amazon S3** — comparison artifacts and session transcripts
 - **AWS Lambda** + **API Gateway** — optional hosted deployment
+- **Amazon EventBridge** + **Amazon SNS** — the daily price alert schedule and its email delivery
 - **boto3** — all AWS access
 - **click** + **rich** — the CLI
 
@@ -162,7 +203,7 @@ The agent has six tools. It chooses which to call, in what order, and how many t
 | `ucp_query` | Structured product discovery | UCP API | Queries UCP-compliant merchants for live product data — price, stock status, verified checkout permalink, merchant, product ID, image. Tried **first** on every product search. Returns an error dict (not an exception) when unavailable, signalling the agent to fall back. |
 | `web_search` | Broad product discovery | Tavily API | Searches the open web for candidate products, brands, and models. Returns title, URL, and a 300-character snippet. Does **not** extract structured prices — the model reads them from snippets. The fallback when UCP returns nothing. |
 | `price_compare` | Ranking + artifact | In-memory + S3 | Merges UCP and web results into one list, drops any error dicts, sorts priced items cheapest-first, flags the best deal, and appends unpriced items at the end. Saves the ranked snapshot to `s3://{bucket}/users/{user_id}/comparisons/{timestamp}.json`. |
-| `save_wishlist` | Persist an item | DynamoDB | Writes a product to `mercato-wishlist` under your `user_id`. The sort key `product_id` is the first 12 characters of the URL's MD5 hash, making saves idempotent per URL. Prices are stored as strings — DynamoDB's Python SDK can't serialize native floats. |
+| `save_wishlist` | Persist an item | DynamoDB | Writes a product to `mercato-wishlist` under your `user_id`. The sort key `product_id` is the first 12 characters of the URL's MD5 hash, making saves idempotent per URL. Prices are stored as strings — DynamoDB's Python SDK can't serialize native floats. Takes an optional `alert_threshold`: set it and the [daily price checker](#-price-drop-alerts) watches the item, omit it and the attribute is left off the record entirely. |
 | `get_wishlist` | Read saved items | DynamoDB | Queries every item for your `user_id`, sorted newest-first by `saved_at`. |
 | `checkout_url` | Open a product | Browser | Returns a product's checkout link and optionally opens it in your default browser. For UCP products this is a direct purchase permalink; for web products it's the product page. |
 
@@ -215,6 +256,8 @@ Copy `.env.example` to `.env` and fill in the following. **`.env` is gitignored 
 | `S3_BUCKET_NAME` | Yes | Bucket for comparison artifacts and session transcripts. **Must be globally unique** — pick your own. |
 | `DYNAMODB_WISHLIST_TABLE` | Yes | Wishlist table name. Defaults to `mercato-wishlist`. |
 | `DYNAMODB_SESSIONS_TABLE` | Yes | Sessions table name. Defaults to `mercato-sessions`. |
+| `ALERT_EMAIL` | Alerts only | The address that receives price drop emails. Required by `infra/setup_price_alerts.py`, which refuses to run on the `.env.example` placeholder. The address must confirm its SNS subscription once before anything is delivered. |
+| `SNS_TOPIC_ARN` | No | ARN of the alerts topic, printed by `infra/setup_price_alerts.py` — fill it in after running that script. Left unset, the price checker still runs and logs what it would have sent, but emails nothing. Commented out by default. |
 | `AWS_PROFILE` | No | Only needed to override the default AWS credential profile. Commented out by default. |
 | `UCP_ENDPOINT` | No | Override the UCP base endpoint. Defaults to `https://api.ucp.dev/v1`. Commented out by default. |
 
@@ -364,6 +407,22 @@ To sign requests, use `botocore`'s `SigV4Auth` (or an equivalent, like `requests
 
 > **🚧 Roadmap — not yet implemented.** The intent is for the CLI to optionally talk to a deployed endpoint by setting `API_GATEWAY_URL` in `.env`, instead of calling the agent in-process. **This is not wired into `cli/main.py` yet.** Today the CLI always runs the agent locally, and the deployed Lambda is reachable only by calling its endpoint directly. Treat the deployment scripts as infrastructure that works, and the CLI integration as future work.
 
+### Deploying the price alert checker
+
+[Price drop alerts](#-price-drop-alerts) run as a second, independent Lambda on its own schedule. It doesn't need the API Gateway deployment above — run these three, in order:
+
+```bash
+python infra/setup_price_alerts.py                   # SNS topic, email subscription, IAM role
+python infra/build_lambda_package.py price-checker   # builds build/mercato-price-checker.zip
+python infra/deploy_price_checker.py                 # deploys the Lambda + daily EventBridge schedule
+```
+
+> **⚠️ `setup_price_alerts.py` sends a real confirmation email, and it must be clicked.** SNS delivers nothing to an unconfirmed address. Open the message from AWS Notifications at your `ALERT_EMAIL` and click the link. Until you do, every alert publishes *successfully* and lands nowhere — which looks exactly like the checker finding no price drops. The link expires after 3 days; re-run the script to send a fresh one.
+
+`setup_price_alerts.py` creates the `mercato-price-alerts` topic and the `mercato-price-checker-role` execution role, granting it `sns:Publish` through an inline policy scoped to that one topic rather than a wildcard. It prints the topic ARN — copy it into `.env` as `SNS_TOPIC_ARN` before deploying, or the checker goes out in log-only mode.
+
+`deploy_price_checker.py` is re-runnable: it creates the function only when absent and otherwise reconciles both code *and* configuration, so filling in `SNS_TOPIC_ARN` afterwards and re-running is the supported way to switch a log-only deployment over to sending email. It refuses to deploy if the topic ARN's region doesn't match the function's, since a cross-region topic would fail every publish *after* the alert had already been consumed.
+
 ---
 
 ## Troubleshooting
@@ -393,6 +452,11 @@ To sign requests, use `botocore`'s `SigV4Auth` (or an equivalent, like `requests
 - **Cause:** Windows terminals default to the cp1252 code page, which can't encode the ✔/✘ glyphs the scripts print.
 - **Solution:** Already handled — every script calls `sys.stdout.reconfigure(encoding="utf-8")` at startup. If you hit this in your own code, set `PYTHONUTF8=1` in your environment.
 
+**Price alert email never arrives**
+
+- **Cause:** SNS email subscriptions deliver nothing until the recipient confirms them. An unconfirmed subscription reads `PendingConfirmation` in place of a real ARN, and every publish to the topic still succeeds while the message is silently dropped — indistinguishable from the checker finding no price drops.
+- **Solution:** Check the `ALERT_EMAIL` inbox — **including the spam folder** — for the message from AWS Notifications and click its confirmation link. If it has lapsed (the links last 3 days), re-run `python infra/setup_price_alerts.py` to send a new one. Also confirm `SNS_TOPIC_ARN` is actually set in `.env`: without it the checker runs in log-only mode and publishes nothing at all.
+
 ---
 
 ## Known Limitations
@@ -402,6 +466,9 @@ Being straightforward about what this does and doesn't do:
 - **UCP is an emerging protocol.** The public UCP endpoint may not resolve, and coverage across merchants is incomplete. In practice the agent frequently falls back to web search. This is handled gracefully — `ucp_query` returns an error dict rather than raising, and the agent moves on to `web_search` without the user noticing — but it means the "structured, purchase-ready data" path is aspirational more often than it's exercised.
 - **Web-search prices are read from snippets, not extracted.** Tavily returns page text, not structured price fields. The model reads prices out of that text, which is usually right but is not a guarantee. Verify before you buy.
 - **The deployed API requires SigV4-signed requests.** The `/chat` route uses `AWS_IAM` authorization — API Gateway rejects any unsigned request with a 403 before it reaches the Lambda. Callers need `execute-api:Invoke` permission on the route (see [Deploying to Lambda + API Gateway](#deploying-to-lambda--api-gateway-optional)), and `user_id` is derived server-side from the signer's verified IAM ARN, never trusted from the request body. This still isn't meant for public/anonymous hosting — every signed call still spends *your* Bedrock and Tavily budget — but it does mean the endpoint can't be invoked, or have its data read or written, by an arbitrary caller with just the URL.
+- **Price alert cost scales with how many alerts exist.** Every wishlist item carrying an `alert_threshold` runs a full agent loop — several Bedrock calls, not one — once per day. Negligible for a handful of items, but the daily bill is (items with alerts) × (calls per item), so it's worth watching if alerts accumulate across users.
+- **The price check declines rather than guesses.** It prices against the saved title, URL, and merchant *together*. An item whose title contradicts its own URL — a "6GB RAM" title pointing at the 8GB listing, say — is refused rather than priced from the wrong variant, so it simply never alerts. The raw reply is logged, so the reason is visible in CloudWatch instead of surfacing as an unexplained "no price found".
+- **The checker's 300-second timeout is shared across the entire run.** Items are priced one at a time, so a large backlog of alerts can be cut short mid-batch. Anything not reached before the timeout isn't checked that day — it keeps its threshold and gets picked up on the next run.
 - **This is a portfolio and learning project, not a production shopping platform.** No rate limiting, no cost controls, no retry/backoff on tool failures, no evaluation harness. It's built to demonstrate an agentic architecture on AWS, and it's honest about being that.
 
 ---
@@ -474,9 +541,12 @@ mercato/
 ├── infra/
 │   ├── setup.py                   # Creates DynamoDB tables + S3 bucket; verifies Bedrock & Tavily
 │   ├── lambda_handler.py          # API Gateway → Lambda entry point
-│   ├── build_lambda_package.py    # Builds the deployment zip (manylinux wheels)
+│   ├── price_checker_handler.py   # Scheduled price alerts — scan, price, publish, consume
+│   ├── build_lambda_package.py    # Builds either zip: agent (default) or price-checker
 │   ├── deploy_lambda.py           # Uploads to S3, updates the Lambda function
-│   └── setup_api_gateway.py       # Creates the HTTP API, route, stage, permissions
+│   ├── deploy_price_checker.py    # Deploys the price checker + its daily EventBridge rule
+│   ├── setup_api_gateway.py       # Creates the HTTP API, route, stage, permissions
+│   └── setup_price_alerts.py      # Creates the SNS topic, email subscription, checker IAM role
 ├── .env.example                   # Template — copy to .env and fill in
 ├── .gitignore
 ├── requirements.txt               # Exact pinned versions
