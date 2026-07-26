@@ -330,18 +330,46 @@ def wait_for_active(lambda_client) -> dict:
     return config
 
 
-def create_or_update_rule(events) -> str:
-    """Create the daily schedule rule, or update it in place. Returns the rule ARN.
+def get_existing_rule_state(events) -> str | None:
+    """Return the current State of the schedule rule, or None if it does not exist.
+
+    Distinguishing "absent" from "present but DISABLED" is what lets
+    create_or_update_rule avoid re-arming a schedule somebody turned off.
+    """
+    try:
+        return events.describe_rule(Name=RULE_NAME)["State"]
+    except events.exceptions.ResourceNotFoundException:
+        return None
+    except (ClientError, BotoCoreError) as e:
+        console.print(f"[red]✘[/red] Could not read the state of rule '{RULE_NAME}': {e}")
+        sys.exit(1)
+
+
+def create_or_update_rule(events) -> tuple[str, str]:
+    """Create the daily schedule rule, or update it in place.
+
+    Returns (rule ARN, the State the rule is now in) — the caller needs the state
+    so the closing summary does not announce a daily run for a disabled schedule.
 
     put_rule overwrites an existing rule of the same name, so this is idempotent
     and also repairs a rule whose schedule was changed by hand. Tags are accepted
     only on creation — EventBridge ignores them when updating.
+
+    The rule's State is preserved rather than forced. put_rule requires a State on
+    every call, so passing a hardcoded "ENABLED" silently re-armed any schedule
+    that had been disabled — turning a routine code deploy into an unannounced
+    restart of a job somebody had deliberately paused, for cost or for safety.
+    ENABLED is now only the default for a rule being created for the first time.
     """
+    existing_state = get_existing_rule_state(events)
+    # None means first-time create; otherwise carry forward whatever is set.
+    state = existing_state or "ENABLED"
+
     try:
         rule_arn = events.put_rule(
             Name=RULE_NAME,
             ScheduleExpression=SCHEDULE_EXPRESSION,
-            State="ENABLED",
+            State=state,
             Description=f"Runs the Mercato wishlist price checker daily at {SCHEDULE_DESCRIPTION_IST}",
             Tags=[{"Key": k, "Value": v} for k, v in PROJECT_TAGS.items()],
         )["RuleArn"]
@@ -349,11 +377,23 @@ def create_or_update_rule(events) -> str:
         console.print(f"[red]✘[/red] Failed to create schedule rule '{RULE_NAME}': {e}")
         sys.exit(1)
 
-    console.print(
-        f"[green]✔[/green] Schedule rule '{RULE_NAME}' set to "
-        f"{SCHEDULE_EXPRESSION} — {SCHEDULE_DESCRIPTION_IST}"
-    )
-    return rule_arn
+    if state == "DISABLED":
+        console.print(
+            f"[yellow]![/yellow] Schedule rule '{RULE_NAME}' was already disabled — "
+            "[bold]left disabled[/bold], this deploy did not turn it back on"
+        )
+        console.print(
+            "  [dim]The code and schedule are updated, but nothing runs until you "
+            "enable it:\n"
+            f"  aws events enable-rule --name {RULE_NAME}[/dim]"
+        )
+    else:
+        console.print(
+            f"[green]✔[/green] Schedule rule '{RULE_NAME}' set to "
+            f"{SCHEDULE_EXPRESSION} — {SCHEDULE_DESCRIPTION_IST}"
+        )
+
+    return rule_arn, state
 
 
 def add_invoke_permission(lambda_client, rule_arn: str) -> None:
@@ -408,7 +448,7 @@ def attach_target(events, function_arn: str) -> None:
     console.print(f"[green]✔[/green] Rule '{RULE_NAME}' now targets '{FUNCTION_NAME}'")
 
 
-def print_summary(config: dict, env_vars: dict) -> None:
+def print_summary(config: dict, env_vars: dict, schedule_state: str) -> None:
     size_mb = config["CodeSize"] / (1024 * 1024)
     console.print(f"[bold cyan]Deployed code size:[/bold cyan] {size_mb:.2f} MB")
     console.print(f"[bold cyan]Timeout / memory:[/bold cyan] {config['Timeout']}s / {config['MemorySize']} MB")
@@ -421,10 +461,21 @@ def print_summary(config: dict, env_vars: dict) -> None:
         else "[yellow]SNS_TOPIC_ARN is unset — alerts will be logged, not emailed.[/yellow]"
     )
 
+    if schedule_state == "DISABLED":
+        schedule_line = (
+            f"[bold]{FUNCTION_NAME}[/bold] is deployed but its schedule is "
+            "[bold yellow]DISABLED[/bold yellow] —\nit will not run until you "
+            f"enable it.\n\n  [cyan]aws events enable-rule --name {RULE_NAME}[/cyan]"
+        )
+    else:
+        schedule_line = (
+            f"[bold]{FUNCTION_NAME}[/bold] runs every day at "
+            f"[bold]{SCHEDULE_DESCRIPTION_IST}[/bold] ({SCHEDULE_EXPRESSION})."
+        )
+
     console.print(
         Panel(
-            f"[bold]{FUNCTION_NAME}[/bold] runs every day at "
-            f"[bold]{SCHEDULE_DESCRIPTION_IST}[/bold] ({SCHEDULE_EXPRESSION}).\n\n"
+            f"{schedule_line}\n\n"
             f"{notify_line}\n\n"
             "[dim]A triggered alert is consumed — its alert_threshold is removed from "
             "the\nwishlist item so one price drop does not notify every day. Test a run "
@@ -494,12 +545,12 @@ def main() -> None:
         function_config = wait_for_update(lambda_client)
 
     console.rule("Schedule")
-    rule_arn = create_or_update_rule(events)
+    rule_arn, schedule_state = create_or_update_rule(events)
     add_invoke_permission(lambda_client, rule_arn)
     attach_target(events, function_config["FunctionArn"])
 
     console.rule("Summary")
-    print_summary(function_config, config["env_vars"])
+    print_summary(function_config, config["env_vars"], schedule_state)
 
 
 if __name__ == "__main__":

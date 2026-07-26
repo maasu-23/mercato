@@ -11,11 +11,15 @@ load-bearing rather than incidental.
 Notifications are live when SNS_TOPIC_ARN is configured: each triggered alert is
 published to that topic, which fans out to whatever is subscribed (ALERT_EMAIL,
 typically). With SNS_TOPIC_ARN unset the run still happens end to end but sends
-nothing, so an unconfigured environment is safe to invoke — triggered alerts are
-printed to CloudWatch and returned in the response either way.
+nothing and consumes nothing, so an unconfigured environment is safe to invoke —
+triggered alerts are printed to CloudWatch and returned in the response either
+way, and their thresholds survive for the next run.
 
-A triggered alert is consumed: its alert_threshold is removed from the item so
-the same price drop is not reported on every subsequent run.
+A delivered alert is consumed: its alert_threshold is removed from the item so
+the same price drop is not reported on every subsequent run. Consumption follows
+a confirmed publish, never detection — an alert that failed to send keeps its
+threshold and is retried, because a duplicate notification is recoverable and a
+silently destroyed one is not.
 
 Unlike infra/lambda_handler.py this is not fronted by API Gateway, so the return
 value is a plain dict for the invoker/logs rather than an HTTP response shape.
@@ -174,6 +178,9 @@ def publish_alert(sns_client, topic_arn: str, alert: dict) -> bool:
         True if SNS accepted the publish, False if it did not. Never raises: one
         undeliverable alert must not abort the alerts behind it or fail the run,
         and the alert is reported in the response regardless.
+
+        The caller treats this return value as the signal to consume the alert —
+        the threshold is only cleared for an alert that actually went out.
     """
     title = alert.get("title", "this item")
 
@@ -188,25 +195,17 @@ def publish_alert(sns_client, topic_arn: str, alert: dict) -> bool:
     if url:
         lines.extend(["", url])
 
-    if alert.get("alert_cleared"):
-        lines.extend(
-            [
-                "",
-                "This alert is now used up. Save the item again with a new alert "
-                "price to keep watching it.",
-            ]
-        )
-    else:
-        # The threshold could not be removed from the item, so the next scheduled
-        # run will find it again. Say so, rather than let a repeat notification
-        # look like a second, separate price drop.
-        lines.extend(
-            [
-                "",
-                "Note: this alert could not be cleared, so you may receive it "
-                "again on the next check.",
-            ]
-        )
+    # Worded without promising the threshold has already been removed: clearing
+    # happens after this publish returns, so its outcome is not knowable here. On
+    # the rare clear failure the user receives this same alert again next run,
+    # which the handler logs as a warning.
+    lines.extend(
+        [
+            "",
+            "This alert has been used up. Save the item again with a new alert "
+            "price to keep watching it.",
+        ]
+    )
 
     try:
         sns_client.publish(
@@ -223,6 +222,11 @@ def publish_alert(sns_client, topic_arn: str, alert: dict) -> bool:
 def _clear_alert_threshold(user_id: str, product_id: str) -> bool:
     """Remove alert_threshold from a single wishlist item, consuming its alert.
 
+    Called only from handler, and only once publish_alert has confirmed the
+    notification actually went out. Consuming an alert that was never delivered
+    destroys it — the item stops matching the scan filter, so nothing ever
+    retries it — which is why detection no longer clears anything itself.
+
     Only the one attribute is removed; the item stays on the wishlist with its
     title, url, price and saved_at untouched. Once cleared the item no longer
     matches the scan filter, so it is not checked again until the user sets a new
@@ -230,8 +234,10 @@ def _clear_alert_threshold(user_id: str, product_id: str) -> bool:
 
     Returns:
         True if the attribute was removed, False if the key was incomplete or the
-        update failed. Never raises — the caller has already decided to notify,
-        and a bookkeeping failure must not suppress that.
+        update failed. Never raises — the notification has already been sent by
+        this point, and a bookkeeping failure must not fail the run. A False here
+        means the user gets a duplicate alert next run, which is the deliberate
+        trade against losing one.
     """
     if not user_id or not product_id:
         print(
@@ -414,9 +420,19 @@ def get_current_price(
 def check_all_alerts(items: list[dict] | None = None) -> list[dict]:
     """Check every alert-bearing wishlist item and return the ones that should notify.
 
-    Prints one summary line per item so a scheduled run is readable in CloudWatch.
+    Detection only — this reads and prices, and changes nothing. Consuming a
+    triggered alert (removing its alert_threshold) is the handler's job, and
+    happens per item only after that item's notification has actually been
+    published.
 
-    Triggering an alert consumes it — see the inline comment on the clear step.
+    That split is the whole point. When this function cleared thresholds itself,
+    a timeout or crash between detection and the publish loop destroyed every
+    alert cleared so far while sending nothing — and because a cleared item no
+    longer matches the scan filter, nothing ever retried it. Leaving the
+    threshold in place until a publish succeeds means the worst case is a
+    duplicate notification rather than a silently lost one.
+
+    Prints one summary line per item so a scheduled run is readable in CloudWatch.
 
     Args:
         items: Optional pre-fetched scan result. Defaults to scanning the table
@@ -425,9 +441,9 @@ def check_all_alerts(items: list[dict] | None = None) -> list[dict]:
 
     Returns:
         A list of dicts, one per item whose current price is at or below its
-        threshold, each with user_id, title, url, alert_threshold, current_price,
-        should_notify, and alert_cleared (False means clearing the threshold
-        failed and this alert will fire again on the next run).
+        threshold, each with user_id, product_id, title, url, alert_threshold,
+        current_price and should_notify. product_id is carried through because
+        the handler needs it, with user_id, to clear the threshold later.
     """
     if items is None:
         items = scan_wishlist_for_alerts()
@@ -466,27 +482,18 @@ def check_all_alerts(items: list[dict] | None = None) -> list[dict]:
                 f"<= threshold {threshold} user={user_id}"
             )
 
-            # Consume the alert by removing alert_threshold from the item. Without
-            # this, a price that stays below the threshold re-triggers on every
-            # scheduled run — one notification per run, indefinitely, for a single
-            # price drop. The item itself is left on the wishlist; only the alert
-            # is spent. A user who wants to keep watching re-saves it with a new
-            # threshold.
-            #
-            # Clearing is best-effort: a failed update means a duplicate alert
-            # next run, which is far better than dropping a notification the user
-            # asked for, so the item is still reported either way.
-            alert_cleared = _clear_alert_threshold(user_id, product_id)
-
+            # The threshold is deliberately left on the item here. It is consumed
+            # in handler, after this alert's publish succeeds — see the docstring
+            # above for why detection must not consume.
             results.append(
                 {
                     "user_id": user_id,
+                    "product_id": product_id,
                     "title": title,
                     "url": url,
                     "alert_threshold": threshold,
                     "current_price": current_price,
                     "should_notify": True,
-                    "alert_cleared": alert_cleared,
                 }
             )
         else:
@@ -501,9 +508,14 @@ def check_all_alerts(items: list[dict] | None = None) -> list[dict]:
 def handler(event, context):
     """Entry point for the scheduled price check.
 
-    Scans, prices, notifies. Returns a 200 with the triggered alerts and how many
-    of them reached SNS, or a 500 carrying the error message. This runs unattended
-    on a schedule, so failures are logged with a full traceback and reported in the
+    Scans, prices, notifies, then consumes — strictly in that order, per item. A
+    triggered alert's threshold is removed only once its notification has been
+    published, so an alert that was never sent survives to be retried on the next
+    run instead of vanishing.
+
+    Returns a 200 with the triggered alerts, how many reached SNS and how many
+    were consumed, or a 500 carrying the error message. This runs unattended on a
+    schedule, so failures are logged with a full traceback and reported in the
     return value rather than passing silently.
     """
     try:
@@ -511,34 +523,65 @@ def handler(event, context):
         items = scan_wishlist_for_alerts()
         results = check_all_alerts(items)
 
-        # Log the triggered alerts as one JSON blob regardless of whether they were
-        # published, so a run can be inspected after the fact without replaying it.
-        print(f"[price-check] results: {json.dumps(results, default=str)}")
-
         published = 0
+        cleared = 0
         topic_arn = config["sns_topic_arn"]
 
         if not topic_arn:
-            # No topic configured: complete the run but send nothing, so an
-            # unprovisioned environment is safe to invoke. Note the alerts have
-            # already been consumed by this point — the log above is the only
-            # record of what would have gone out.
+            # No topic configured: complete the run but send nothing. Nothing is
+            # consumed either, so an unprovisioned environment is genuinely safe
+            # to invoke — every threshold survives and the same alerts trigger
+            # again once a topic is configured.
             print(
                 "[price-check] SNS_TOPIC_ARN not set — notifications skipped, "
-                "alerts logged only"
+                "alerts logged only, no thresholds consumed"
             )
+            for alert in results:
+                alert["published"] = False
+                alert["alert_cleared"] = False
         elif results:
             sns_client = boto3.client("sns", region_name=config["region"])
+
             for alert in results:
-                if publish_alert(sns_client, topic_arn, alert):
-                    published += 1
-            print(f"[price-check] published {published}/{len(results)} alert(s)")
+                # Publish first, consume second, one item at a time. A crash or
+                # timeout partway through this loop leaves every unprocessed
+                # alert's threshold intact, so the next run picks them up.
+                was_published = publish_alert(sns_client, topic_arn, alert)
+                alert["published"] = was_published
+
+                if not was_published:
+                    # Deliberately not consumed: the user never got this alert,
+                    # so it must remain eligible for the next run.
+                    alert["alert_cleared"] = False
+                    print(
+                        f"[price-check] keeping threshold for "
+                        f"{alert.get('title')!r} — publish failed, will retry "
+                        "next run"
+                    )
+                    continue
+
+                published += 1
+                alert["alert_cleared"] = _clear_alert_threshold(
+                    alert.get("user_id", ""), alert.get("product_id", "")
+                )
+                if alert["alert_cleared"]:
+                    cleared += 1
+
+            print(
+                f"[price-check] published {published}/{len(results)} alert(s), "
+                f"consumed {cleared}"
+            )
+
+        # Logged after the publish loop so the blob carries each alert's final
+        # published/alert_cleared outcome, not just what was detected.
+        print(f"[price-check] results: {json.dumps(results, default=str)}")
 
         return {
             "statusCode": 200,
             "checked": len(items),
             "alerts_triggered": len(results),
             "published": published,
+            "cleared": cleared,
             "results": results,
         }
     except Exception as e:
