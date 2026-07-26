@@ -45,5 +45,15 @@ logs/
 tmp/
 .local/
 
+# Lambda invoke output
+# out.json is the conventional name for `aws lambda invoke` output, and the
+# price checker's deploy script suggests exactly that command as a test run. Its
+# response body carries real user data — wishlist titles, product URLs, and
+# hashed user_ids for every user with a triggered alert — so a locally generated
+# copy must never be committed. The /*.json rule is anchored to the repo root so
+# any similarly-named response dump is caught too; nested JSON is unaffected.
+out.json
+/*.json
+
 # Jupyter
 .ipynb_checkpoints/

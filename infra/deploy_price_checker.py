@@ -418,7 +418,10 @@ def print_summary(config: dict, env_vars: dict) -> None:
             "[dim]A triggered alert is consumed — its alert_threshold is removed from "
             "the\nwishlist item so one price drop does not notify every day. Test a run "
             "now with:\n"
-            f"  aws lambda invoke --function-name {FUNCTION_NAME} out.json[/dim]",
+            f"  aws lambda invoke --function-name {FUNCTION_NAME} build/out.json\n\n"
+            "The response body lists every triggered alert — product titles, URLs and "
+            "user\nids. It is written under build/ because that directory is already "
+            "gitignored;\nkeep it there rather than dropping it in the repo root.[/dim]",
             title="[bold]Scheduled[/bold]",
             border_style="cyan",
         )
