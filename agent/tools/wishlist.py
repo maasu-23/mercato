@@ -93,10 +93,13 @@ def save_wishlist(
         currency: Price currency (default "INR").
         alert_threshold: Optional price alert. When set, the user wants to be
             notified once the product's price drops to or below this value.
-            Nothing in this module acts on it — the comparison is the job of a
-            separate scheduled process that is not built yet; save_wishlist only
-            records the user's intent. Omitted entirely from the stored item when
-            not provided, so items without an alert carry no empty field.
+            Nothing in this module acts on it — a separate scheduled Lambda
+            (infra/price_checker_handler.py) scans wishlist items with an
+            alert_threshold once a day and, when a checked price has dropped
+            to or below it, sends an email via SNS and clears the threshold
+            so the alert fires only once; save_wishlist only records the
+            user's intent. Omitted entirely from the stored item when not
+            provided, so items without an alert carry no empty field.
 
     Returns:
         A dict. On success:
