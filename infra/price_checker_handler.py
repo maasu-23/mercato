@@ -34,7 +34,7 @@ import traceback
 from decimal import Decimal, InvalidOperation
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 DEFAULT_REGION = "ap-south-1"
 DEFAULT_WISHLIST_TABLE = "mercato-wishlist"
@@ -288,7 +288,10 @@ def _claim_alert(user_id: str, product_id: str) -> str:
         publish it or return it. CLAIM_UNAVAILABLE when the condition failed:
         another run claimed it first, or the item is gone. CLAIM_ERROR for any
         other failure, where the threshold is most likely still in place and the
-        next run picks it up normally.
+        next run picks it up normally — EXCEPT after a connection-level failure
+        (timeout, dropped socket), where that is a guess rather than a fact: see
+        the BotoCoreError branch below and the matching note in the README's
+        Known Limitations. That gap is real and not fully closeable from here.
 
         An incomplete key is CLAIM_ERROR too. An alert that cannot be claimed
         cannot be deduplicated either, so publishing it anyway would re-notify on
@@ -323,6 +326,42 @@ def _claim_alert(user_id: str, product_id: str) -> str:
         print(
             f"[price-check] WARNING failed to claim alert for product_id="
             f"{product_id} user={user_id}: {e} — not publishing, will retry next run"
+        )
+        return CLAIM_ERROR
+    except BotoCoreError as e:
+        # KNOWN EDGE CASE, distinct from the two lost-alert windows in the
+        # README's Known Limitations (both of which happen *after* a successful
+        # claim). This one is about the claim write itself: a connection-level
+        # failure — timeout, dropped socket, DNS blip — raises here whether or
+        # not DynamoDB actually applied the REMOVE before the acknowledgement
+        # was lost. There is no way to tell from this exception alone, because
+        # the thing that went missing is exactly the message that would say so.
+        #
+        # If the write did apply, this item has already left the scan filter
+        # for good — it will NOT be "retried next run" the way the log line
+        # below says, because nothing about it looks unclaimed anymore. A
+        # resend (botocore's own retry policy, or an overlapping invocation)
+        # then hits ConditionalCheckFailedException against the now-missing
+        # attribute and logs CLAIM_UNAVAILABLE — identical to the log line for
+        # an unrelated, genuine concurrent claim, so the two are not
+        # distinguishable after the fact either.
+        #
+        # Resolving this for certain needs a follow-up read of the item to
+        # check whether alert_threshold is still there. Deliberately not added:
+        # the deployed execution role is scoped to exactly dynamodb:Scan and
+        # dynamodb:UpdateItem (see build_least_privilege_policy in
+        # infra/setup_price_alerts.py and the README's least-privilege
+        # section) — no GetItem, on purpose. Adding this check would mean
+        # widening a live IAM policy for a read that is only best-effort even
+        # with permission (it races the same flaky connection, and can itself
+        # be stale or fail). Left as an honest, undisguised gap rather than a
+        # guess dressed up as a fix.
+        print(
+            f"[price-check] WARNING connection error claiming alert for "
+            f"product_id={product_id} user={user_id}: {e} — cannot tell "
+            "whether the update applied before the response was lost; not "
+            "publishing this run, but if it did apply this alert will NOT be "
+            "retried (see _claim_alert's docstring)"
         )
         return CLAIM_ERROR
     except Exception as e:
