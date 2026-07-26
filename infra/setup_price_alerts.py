@@ -432,7 +432,9 @@ def build_least_privilege_policy(
         "Statement": [
             {
                 # scan_wishlist_for_alerts scans for alert-bearing items;
-                # _clear_alert_threshold removes the threshold from one item.
+                # _claim_alert and _restore_alert_threshold conditionally update
+                # the threshold on one item. Conditional writes need no extra
+                # permission beyond UpdateItem.
                 # No Query/PutItem/GetItem — this handler makes none of those
                 # calls — and no DescribeTable, since boto3's Table() resource is
                 # lazy and never fetches metadata here. The sessions table is not

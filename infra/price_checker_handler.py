@@ -15,11 +15,14 @@ nothing and consumes nothing, so an unconfigured environment is safe to invoke �
 triggered alerts are printed to CloudWatch and returned in the response either
 way, and their thresholds survive for the next run.
 
-A delivered alert is consumed: its alert_threshold is removed from the item so
-the same price drop is not reported on every subsequent run. Consumption follows
-a confirmed publish, never detection — an alert that failed to send keeps its
-threshold and is retried, because a duplicate notification is recoverable and a
-silently destroyed one is not.
+An alert is consumed by removing its alert_threshold, so the same price drop is
+not reported on every subsequent run. That removal is an atomic *claim* taken
+BEFORE the notification is sent — conditional on the threshold still being there,
+and rolled back if the send then fails. Claiming first is what makes two
+overlapping runs safe: they race on the conditional update, the loser's fails,
+and exactly one of them notifies. See _claim_alert for why the same condition
+also stops a deleted item from being resurrected, and handler for the rollback
+and the two edge cases it does not cover.
 
 Unlike infra/lambda_handler.py this is not fronted by API Gateway, so the return
 value is a plain dict for the invoker/logs rather than an HTTP response shape.
@@ -31,6 +34,7 @@ import traceback
 from decimal import Decimal, InvalidOperation
 
 import boto3
+from botocore.exceptions import ClientError
 
 DEFAULT_REGION = "ap-south-1"
 DEFAULT_WISHLIST_TABLE = "mercato-wishlist"
@@ -71,6 +75,23 @@ PRICE_PROMPT = (
     "you cannot identify the product confidently enough to estimate a price, "
     "reply with exactly: UNKNOWN"
 )
+
+# _claim_alert outcomes. Only CLAIM_OK may be followed by a publish; every other
+# value means this run does not own the alert and must send nothing. They are
+# distinct values rather than a bool because the response and the logs need to
+# tell "another run already has it" apart from "DynamoDB refused the write" —
+# the first is routine, the second wants looking at.
+CLAIM_OK = "claimed"
+CLAIM_UNAVAILABLE = "unavailable"
+CLAIM_ERROR = "error"
+CLAIM_NOT_ATTEMPTED = "not_attempted"
+
+# _restore_alert_threshold outcomes, for the same reason: an item the user
+# deleted mid-publish has nothing left to restore and nothing worth alerting on,
+# which must not be reported as the data loss that RESTORE_FAILED is.
+RESTORE_OK = "restored"
+RESTORE_ITEM_GONE = "item_gone"
+RESTORE_FAILED = "failed"
 
 
 def _config() -> dict:
@@ -179,8 +200,10 @@ def publish_alert(sns_client, topic_arn: str, alert: dict) -> bool:
         undeliverable alert must not abort the alerts behind it or fail the run,
         and the alert is reported in the response regardless.
 
-        The caller treats this return value as the signal to consume the alert —
-        the threshold is only cleared for an alert that actually went out.
+        The caller has already claimed this alert by the time this runs, so the
+        return value decides whether that claim stands: True leaves the threshold
+        consumed, False makes the caller hand it back via
+        _restore_alert_threshold so the next run retries it.
     """
     title = alert.get("title", "this item")
 
@@ -195,10 +218,10 @@ def publish_alert(sns_client, topic_arn: str, alert: dict) -> bool:
     if url:
         lines.extend(["", url])
 
-    # Worded without promising the threshold has already been removed: clearing
-    # happens after this publish returns, so its outcome is not knowable here. On
-    # the rare clear failure the user receives this same alert again next run,
-    # which the handler logs as a warning.
+    # Accurate as written, now that claiming precedes publishing: the threshold
+    # was already removed before this call. The only path that puts it back is a
+    # publish that failed — in which case this message was never delivered, so
+    # nobody reads a promise the item no longer keeps.
     lines.extend(
         [
             "",
@@ -219,45 +242,146 @@ def publish_alert(sns_client, topic_arn: str, alert: dict) -> bool:
         return False
 
 
-def _clear_alert_threshold(user_id: str, product_id: str) -> bool:
-    """Remove alert_threshold from a single wishlist item, consuming its alert.
+def _claim_alert(user_id: str, product_id: str) -> str:
+    """Atomically claim one triggered alert by removing its alert_threshold.
 
-    Called only from handler, and only once publish_alert has confirmed the
-    notification actually went out. Consuming an alert that was never delivered
-    destroys it — the item stops matching the scan filter, so nothing ever
-    retries it — which is why detection no longer clears anything itself.
+    This is the concurrency control for the whole module, and it runs *before*
+    the notification is sent rather than after. The condition does the work:
+
+        ConditionExpression="attribute_exists(alert_threshold)"
+
+    DynamoDB evaluates that condition and applies the write as one operation, so
+    there is no window between checking and clearing for a second run to slip
+    into. It fails, rather than writing, in both of the cases that used to cause
+    a problem:
+
+    - **Phantom items.** An unconditional update_item is an upsert. If the user
+      deleted this wishlist item between the scan and this call, DynamoDB would
+      cheerfully recreate it as a row holding nothing but user_id and product_id
+      — a record with no title, no url and no price, which every reader then has
+      to defend against. A deleted item has no alert_threshold either, so the
+      condition fails and nothing is written.
+
+    - **Concurrent runs.** A manual invoke overlapping the schedule, or an async
+      retry firing while the first invocation is still going, scans the same
+      table and detects the same alert. Whichever run reaches this call first
+      removes the attribute; the second one's condition then fails against the
+      already-removed attribute, so exactly one of them goes on to publish.
 
     Only the one attribute is removed; the item stays on the wishlist with its
-    title, url, price and saved_at untouched. Once cleared the item no longer
-    matches the scan filter, so it is not checked again until the user sets a new
-    threshold.
+    title, url, price and saved_at untouched. Once claimed it no longer matches
+    the scan filter, so it is not checked again until the user sets a new
+    threshold — or until _restore_alert_threshold hands this claim back.
 
     Returns:
-        True if the attribute was removed, False if the key was incomplete or the
-        update failed. Never raises — the notification has already been sent by
-        this point, and a bookkeeping failure must not fail the run. A False here
-        means the user gets a duplicate alert next run, which is the deliberate
-        trade against losing one.
+        CLAIM_OK when this run now owns the alert, and must therefore either
+        publish it or return it. CLAIM_UNAVAILABLE when the condition failed:
+        another run claimed it first, or the item is gone. CLAIM_ERROR for any
+        other failure, where the threshold is most likely still in place and the
+        next run picks it up normally.
+
+        An incomplete key is CLAIM_ERROR too. An alert that cannot be claimed
+        cannot be deduplicated either, so publishing it anyway would re-notify on
+        every run forever — the exact behaviour consumption exists to prevent.
+
+        Never raises: one unclaimable alert must not abort the alerts behind it.
     """
     if not user_id or not product_id:
         print(
-            f"[price-check] WARNING cannot clear alert, incomplete key "
-            f"user={user_id!r} product_id={product_id!r} — alert will re-fire"
+            f"[price-check] WARNING cannot claim alert, incomplete key "
+            f"user={user_id!r} product_id={product_id!r} — not publishing it"
         )
-        return False
+        return CLAIM_ERROR
 
     try:
         _get_table().update_item(
             Key={"user_id": user_id, "product_id": product_id},
             UpdateExpression="REMOVE alert_threshold",
+            ConditionExpression="attribute_exists(alert_threshold)",
         )
-        return True
+        return CLAIM_OK
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            # Routine, not an error: the alert is someone else's or the item was
+            # deleted after the scan read it. Either way this run sends nothing.
+            print(
+                f"[price-check] alert already claimed or item deleted, skipping "
+                f"product_id={product_id} user={user_id}"
+            )
+            return CLAIM_UNAVAILABLE
+
+        print(
+            f"[price-check] WARNING failed to claim alert for product_id="
+            f"{product_id} user={user_id}: {e} — not publishing, will retry next run"
+        )
+        return CLAIM_ERROR
     except Exception as e:
         print(
-            f"[price-check] WARNING failed to clear alert for product_id="
-            f"{product_id} user={user_id}: {e} — alert will re-fire next run"
+            f"[price-check] WARNING failed to claim alert for product_id="
+            f"{product_id} user={user_id}: {e} — not publishing, will retry next run"
         )
-        return False
+        return CLAIM_ERROR
+
+
+def _restore_alert_threshold(user_id: str, product_id: str, threshold) -> str:
+    """Hand a claimed alert back after its notification failed to send.
+
+    The compensating half of _claim_alert. Claiming removes the threshold before
+    the publish is attempted, so without this a failed publish would destroy an
+    alert the user never received. Putting the value back makes the item match
+    the scan filter again, and the next run retries it.
+
+    The value is rewritten as a string, matching how save_wishlist stores it —
+    boto3's DynamoDB resource cannot serialize a native float. _as_float reads
+    either form, so a restored "1299.0" and an originally-saved "1299" behave
+    identically downstream; only the stored text differs.
+
+    ConditionExpression="attribute_exists(product_id)" guards the same phantom
+    write _claim_alert guards, from the other direction. product_id is half the
+    key, so it exists on exactly the items that exist; if the user deleted the
+    item during the publish attempt, the restore fails instead of resurrecting it
+    as a row carrying a threshold and nothing else.
+
+    Returns:
+        RESTORE_OK when the threshold is back on the item. RESTORE_ITEM_GONE when
+        the item was deleted meanwhile — nothing was restored, but nothing was
+        lost either, since there is no longer an item to alert on.
+        RESTORE_FAILED otherwise, which is the one path in this module that
+        destroys an alert outright: claimed, never sent, and no longer eligible
+        to be retried. The handler counts and logs that case loudly. Never
+        raises.
+    """
+    if not user_id or not product_id or threshold is None:
+        print(
+            f"[price-check] ERROR cannot restore alert, incomplete key or "
+            f"threshold user={user_id!r} product_id={product_id!r} "
+            f"threshold={threshold!r}"
+        )
+        return RESTORE_FAILED
+
+    try:
+        _get_table().update_item(
+            Key={"user_id": user_id, "product_id": product_id},
+            UpdateExpression="SET alert_threshold = :threshold",
+            ConditionExpression="attribute_exists(product_id)",
+            ExpressionAttributeValues={":threshold": str(threshold)},
+        )
+        return RESTORE_OK
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return RESTORE_ITEM_GONE
+
+        print(
+            f"[price-check] ERROR failed to restore alert_threshold "
+            f"{threshold!r} for product_id={product_id} user={user_id}: {e}"
+        )
+        return RESTORE_FAILED
+    except Exception as e:
+        print(
+            f"[price-check] ERROR failed to restore alert_threshold "
+            f"{threshold!r} for product_id={product_id} user={user_id}: {e}"
+        )
+        return RESTORE_FAILED
 
 
 def scan_wishlist_for_alerts() -> list[dict]:
@@ -420,17 +544,21 @@ def get_current_price(
 def check_all_alerts(items: list[dict] | None = None) -> list[dict]:
     """Check every alert-bearing wishlist item and return the ones that should notify.
 
-    Detection only — this reads and prices, and changes nothing. Consuming a
-    triggered alert (removing its alert_threshold) is the handler's job, and
-    happens per item only after that item's notification has actually been
-    published.
+    Detection only — this reads and prices, and changes nothing. Claiming a
+    triggered alert (atomically removing its alert_threshold) and notifying on it
+    are both the handler's job, in that order, per item.
 
     That split is the whole point. When this function cleared thresholds itself,
     a timeout or crash between detection and the publish loop destroyed every
     alert cleared so far while sending nothing — and because a cleared item no
-    longer matches the scan filter, nothing ever retried it. Leaving the
-    threshold in place until a publish succeeds means the worst case is a
-    duplicate notification rather than a silently lost one.
+    longer matches the scan filter, nothing ever retried it. Keeping the write
+    out of detection narrows that exposure from the whole batch to a single item:
+    the handler claims one alert immediately before publishing that same alert.
+
+    Pricing every item takes a Bedrock call apiece, so the scan result is a
+    snapshot that ages while this runs. Nothing here re-reads it. An item deleted,
+    re-saved, or already handled by an overlapping run in the meantime is caught
+    by the claim's condition in the handler, not by anything checked here.
 
     Prints one summary line per item so a scheduled run is readable in CloudWatch.
 
@@ -443,7 +571,9 @@ def check_all_alerts(items: list[dict] | None = None) -> list[dict]:
         A list of dicts, one per item whose current price is at or below its
         threshold, each with user_id, product_id, title, url, alert_threshold,
         current_price and should_notify. product_id is carried through because
-        the handler needs it, with user_id, to clear the threshold later.
+        the handler needs it, with user_id, to claim the alert; alert_threshold
+        is carried through because the handler needs the original value to put
+        back if the publish then fails.
     """
     if items is None:
         items = scan_wishlist_for_alerts()
@@ -482,9 +612,9 @@ def check_all_alerts(items: list[dict] | None = None) -> list[dict]:
                 f"<= threshold {threshold} user={user_id}"
             )
 
-            # The threshold is deliberately left on the item here. It is consumed
-            # in handler, after this alert's publish succeeds — see the docstring
-            # above for why detection must not consume.
+            # The threshold is deliberately left on the item here. The handler
+            # claims it immediately before publishing this alert — see the
+            # docstring above for why detection must not write.
             results.append(
                 {
                     "user_id": user_id,
@@ -508,13 +638,41 @@ def check_all_alerts(items: list[dict] | None = None) -> list[dict]:
 def handler(event, context):
     """Entry point for the scheduled price check.
 
-    Scans, prices, notifies, then consumes — strictly in that order, per item. A
-    triggered alert's threshold is removed only once its notification has been
-    published, so an alert that was never sent survives to be retried on the next
-    run instead of vanishing.
+    Scans, prices, claims, then notifies — per item, strictly in that order. The
+    claim is an atomic conditional update that removes the alert_threshold, and
+    it precedes the publish rather than following it. That ordering is what makes
+    this run safe to overlap with another one: two invocations that both detect
+    the same alert race on the claim, and only the winner publishes. It is also
+    what keeps a deleted item deleted, since the same condition refuses the
+    upsert that an unconditional update would have performed. See _claim_alert.
 
-    Returns a 200 with the triggered alerts, how many reached SNS and how many
-    were consumed, or a 500 carrying the error message. This runs unattended on a
+    A publish that fails after a successful claim is rolled back:
+    _restore_alert_threshold puts the threshold back, so the alert is retried on
+    the next run rather than vanishing with nothing sent.
+
+    KNOWN EDGE CASES, both of which lose an alert. Neither is retryable, because
+    an item without a threshold no longer matches the scan filter:
+
+    - Claim succeeds, publish fails, and the restore fails too. Reported as
+      `lost` in the response and logged as ERROR with the item's key, which is
+      enough to put the threshold back by hand.
+    - The invocation dies between the claim and the publish — Lambda timeout, an
+      OOM kill, an SNS call that hangs past the remaining duration. The rollback
+      never gets to run. The window is one item wide and normally milliseconds,
+      but it is not zero. Closing it properly means writing the claim as an
+      in-flight marker (a claimed_at attribute) and adding a reaper for stale
+      ones, which is more machinery than this failure rate justifies.
+
+    The previous ordering — publish, then clear — had no such window, but paid
+    for it with a duplicate notification on every overlapping run and with
+    phantom rows from unconditional upserts. Losing an alert to a crash in a
+    millisecond-wide window is rarer than either, and unlike them it is visible
+    in the logs when it happens.
+
+    Returns a 200 with the triggered alerts and counts of how many were
+    published, consumed, skipped and lost, or a 500 carrying the error message.
+    Each result dict picks up `claim`, `published`, `alert_cleared` and — only
+    where a publish was rolled back — `alert_restored`. This runs unattended on a
     schedule, so failures are logged with a full traceback and reported in the
     return value rather than passing silently.
     """
@@ -525,51 +683,85 @@ def handler(event, context):
 
         published = 0
         cleared = 0
+        skipped = 0
+        lost = 0
         topic_arn = config["sns_topic_arn"]
 
         if not topic_arn:
             # No topic configured: complete the run but send nothing. Nothing is
-            # consumed either, so an unprovisioned environment is genuinely safe
+            # claimed either, so an unprovisioned environment is genuinely safe
             # to invoke — every threshold survives and the same alerts trigger
             # again once a topic is configured.
             print(
                 "[price-check] SNS_TOPIC_ARN not set — notifications skipped, "
-                "alerts logged only, no thresholds consumed"
+                "alerts logged only, nothing claimed"
             )
             for alert in results:
+                alert["claim"] = CLAIM_NOT_ATTEMPTED
                 alert["published"] = False
                 alert["alert_cleared"] = False
         elif results:
             sns_client = boto3.client("sns", region_name=config["region"])
 
             for alert in results:
-                # Publish first, consume second, one item at a time. A crash or
-                # timeout partway through this loop leaves every unprocessed
-                # alert's threshold intact, so the next run picks them up.
+                user_id = alert.get("user_id", "")
+                product_id = alert.get("product_id", "")
+                title = alert.get("title")
+
+                # Claim first, publish second, one item at a time. Nothing is
+                # sent for an alert this run does not own, and a crash partway
+                # through the loop leaves every alert behind it untouched.
+                claim = _claim_alert(user_id, product_id)
+                alert["claim"] = claim
+
+                if claim != CLAIM_OK:
+                    # Not ours: another run is handling it, the item is gone, or
+                    # DynamoDB refused the write. _claim_alert logged which.
+                    alert["published"] = False
+                    alert["alert_cleared"] = False
+                    skipped += 1
+                    continue
+
                 was_published = publish_alert(sns_client, topic_arn, alert)
                 alert["published"] = was_published
 
-                if not was_published:
-                    # Deliberately not consumed: the user never got this alert,
-                    # so it must remain eligible for the next run.
-                    alert["alert_cleared"] = False
-                    print(
-                        f"[price-check] keeping threshold for "
-                        f"{alert.get('title')!r} — publish failed, will retry "
-                        "next run"
-                    )
+                if was_published:
+                    alert["alert_cleared"] = True
+                    published += 1
+                    cleared += 1
                     continue
 
-                published += 1
-                alert["alert_cleared"] = _clear_alert_threshold(
-                    alert.get("user_id", ""), alert.get("product_id", "")
+                # Claimed but never sent. Give the threshold back, so this is a
+                # retry next run rather than an alert the user silently never
+                # gets.
+                restored = _restore_alert_threshold(
+                    user_id, product_id, alert.get("alert_threshold")
                 )
-                if alert["alert_cleared"]:
-                    cleared += 1
+                alert["alert_restored"] = restored
+                alert["alert_cleared"] = restored != RESTORE_OK
+
+                if restored == RESTORE_OK:
+                    print(
+                        f"[price-check] restored threshold for {title!r} — "
+                        "publish failed, will retry next run"
+                    )
+                elif restored == RESTORE_ITEM_GONE:
+                    print(
+                        f"[price-check] publish failed for {title!r} and the "
+                        "item was deleted meanwhile — nothing to restore"
+                    )
+                else:
+                    lost += 1
+                    print(
+                        f"[price-check] ERROR alert LOST for {title!r} "
+                        f"user={user_id} product_id={product_id} — claimed, "
+                        "publish failed, and the threshold could not be put "
+                        "back; it will not re-fire and needs setting by hand"
+                    )
 
             print(
                 f"[price-check] published {published}/{len(results)} alert(s), "
-                f"consumed {cleared}"
+                f"consumed {cleared}, skipped {skipped}, lost {lost}"
             )
 
         # Logged after the publish loop so the blob carries each alert's final
@@ -582,6 +774,8 @@ def handler(event, context):
             "alerts_triggered": len(results),
             "published": published,
             "cleared": cleared,
+            "skipped": skipped,
+            "lost": lost,
             "results": results,
         }
     except Exception as e:
