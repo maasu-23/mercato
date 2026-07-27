@@ -106,11 +106,24 @@ def _config() -> dict:
     }
 
 
+_table = None
+
+
 def _get_table():
-    """Return the wishlist DynamoDB table handle."""
-    config = _config()
-    resource = boto3.resource("dynamodb", region_name=config["region"])
-    return resource.Table(config["wishlist_table"])
+    """Return a lazily-built, module-level wishlist DynamoDB table singleton.
+
+    Cached at module scope for the same reason _get_price_llm is: this is called
+    once per scan page and again for every claim and every restore, and each call
+    was previously constructing a fresh boto3 resource — building the service
+    model and resolving credentials from scratch — to hand back a handle on the
+    same table. Warm invocations now reuse one.
+    """
+    global _table
+    if _table is None:
+        config = _config()
+        resource = boto3.resource("dynamodb", region_name=config["region"])
+        _table = resource.Table(config["wishlist_table"])
+    return _table
 
 
 def _as_float(value) -> float | None:

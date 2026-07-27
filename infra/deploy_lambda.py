@@ -31,7 +31,14 @@ LAMBDA_HANDLER = "lambda_handler.handler"
 # already gone. This only matters on the API Gateway path — the CLI runs the
 # agent in-process and is not bounded by this Lambda or this API at all.
 LAMBDA_TIMEOUT = 28
-LAMBDA_MEMORY_MB = 512
+# Lambda allocates CPU proportionally to memory, so this is a CPU setting as much
+# as a memory one. The cold-start cost here is import-bound (langchain, langgraph,
+# boto3, and building the compiled graph), which is pure CPU work — 1024MB roughly
+# halves it against 512MB. The warm portion is dominated by waiting on Bedrock and
+# Tavily, so the extra memory adds almost nothing to billed GB-seconds there: twice
+# the memory over roughly half the init duration is close to cost-neutral, and the
+# saved seconds matter against the 30s ceiling above.
+LAMBDA_MEMORY_MB = 1024
 
 LAMBDA_TRUST_POLICY = {
     "Version": "2012-10-17",

@@ -67,6 +67,21 @@ save_wishlist as alert_threshold. Only set it when the user actually asks for an
 alert — never infer one from the current price."""
 
 _graph = None
+_s3_client = None
+
+
+def _get_s3_client():
+    """Return a lazily-initialised, module-level boto3 S3 client singleton.
+
+    Same pattern as agent/tools/price_compare.py's _get_s3_client. Client
+    construction is not free (it builds the service model and resolves
+    credentials), and this was previously paying that cost on every single turn
+    just to write one session transcript.
+    """
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=AWS_REGION)
+    return _s3_client
 
 
 def _build_llm() -> ChatBedrockConverse:
@@ -91,8 +106,7 @@ def _save_session_to_s3(user_id: str, messages: list) -> None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         key = f"users/{user_id}/sessions/{timestamp}.json"
         body = json.dumps(serialized, default=str).encode("utf-8")
-        s3 = boto3.client("s3", region_name=AWS_REGION)
-        s3.put_object(
+        _get_s3_client().put_object(
             Bucket=S3_BUCKET_NAME,
             Key=key,
             Body=body,

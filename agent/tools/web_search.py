@@ -31,10 +31,14 @@ def _get_client() -> TavilyClient | None:
 def web_search(query: str) -> list[dict]:
     """Search the web for products matching a query.
 
-    Use this tool for broad product discovery — finding candidate products,
-    brands, models, or general shopping information across the open web. It is
-    also the fallback when the Universal Commerce Protocol (UCP) query returns
-    no results for a merchant.
+    This is the primary tool for product discovery — finding candidate
+    products, brands, models, or general shopping information across the open
+    web. Reach for it first on any product search.
+
+    ucp_query is an optional supplement, not a prerequisite: try it alongside
+    this tool when you judge structured merchant data would help, and combine
+    whatever both return. UCP coverage is currently limited, so results from
+    here are what you can rely on.
 
     Args:
         query: A natural-language product search query, e.g.
@@ -60,7 +64,11 @@ def web_search(query: str) -> list[dict]:
         response = client.search(
             query=query,
             search_depth="advanced",
-            max_results=8,
+            # Matches the system prompt's "present only the top 3-5 results".
+            # Anything past 5 was fetched, fed through price_compare, tokenized
+            # into the model's context, and then dropped unmentioned — paid for
+            # on every discovery turn and never seen by the user.
+            max_results=5,
             include_answer=False,
         )
 
