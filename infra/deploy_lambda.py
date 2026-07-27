@@ -21,7 +21,16 @@ S3_KEY = "lambda/mercato-lambda.zip"
 ROLE_NAME = "mercato-lambda-role"
 LAMBDA_RUNTIME = "python3.11"
 LAMBDA_HANDLER = "lambda_handler.handler"
-LAMBDA_TIMEOUT = 60
+# The HTTP API integration in front of this function (infra/setup_api_gateway.py)
+# has a hard, non-increasable 30s ceiling — an AWS-enforced maximum for every
+# HTTP API, not a default that can be raised. A Lambda timeout of 60s let
+# invocations run past that ceiling: the caller already had a 504 in hand, but
+# the Lambda kept running (and billing for) Bedrock calls nobody would ever see
+# the result of. 28s keeps a small margin under the 30s wall so the function
+# times itself out first, instead of running to no purpose after the caller is
+# already gone. This only matters on the API Gateway path — the CLI runs the
+# agent in-process and is not bounded by this Lambda or this API at all.
+LAMBDA_TIMEOUT = 28
 LAMBDA_MEMORY_MB = 512
 
 LAMBDA_TRUST_POLICY = {
