@@ -282,6 +282,9 @@ This is *not* what the deployed Lambdas run as. Those use their own execution ro
       "Effect": "Allow",
       "Action": [
         "dynamodb:CreateTable",
+        "dynamodb:DescribeTable",
+        "dynamodb:TagResource",
+        "dynamodb:UpdateContinuousBackups",
         "dynamodb:PutItem",
         "dynamodb:GetItem",
         "dynamodb:Query"
@@ -297,7 +300,9 @@ This is *not* what the deployed Lambdas run as. Those use their own execution ro
       "Action": [
         "s3:CreateBucket",
         "s3:PutObject",
-        "s3:PutBucketPublicAccessBlock"
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutBucketTagging",
+        "s3:PutLifecycleConfiguration"
       ],
       "Resource": [
         "arn:aws:s3:::YOUR_BUCKET_NAME",
