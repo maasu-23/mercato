@@ -21,10 +21,12 @@ def ucp_query(query: str, category: str = "", max_results: int = 6) -> list[dict
     compliant merchants — such as Walmart, Nike, and Shopify-hosted stores —
     through a single consistent interface.
 
-    Call this tool FIRST, before web_search. Unlike a general web search, UCP
-    returns structured price data, stock status, and verified checkout
-    permalinks that can be used directly for purchase. Only fall back to
-    web_search if UCP returns no results or is unavailable.
+    UCP is an emerging protocol with no stable public endpoint as of this
+    writing, so this is not the primary discovery tool — use web_search for
+    that. Try this one when you judge it might help; when it returns
+    structured price data, stock status, and verified checkout permalinks,
+    those are more usable directly than a web snippet. On error or no
+    results, fall back to (or stick with) web_search.
 
     Args:
         query: A natural-language or keyword product search, e.g.
