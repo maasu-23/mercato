@@ -31,22 +31,27 @@ BUILD_DIR = ROOT_DIR / "build"
 
 # What both targets need to talk to Bedrock.
 #
-# langchain-core is a transitive dependency of langchain-aws, not a direct import
-# of the price checker. It is pinned here anyway so both packages resolve to the
-# same version rather than to whatever the range allows on the day.
+# langchain-core and httpx are transitive dependencies of langchain-aws (via
+# langsmith), not direct imports of the price checker. Both are pinned here
+# anyway so both packages resolve to the same version rather than to whatever
+# the range allows on the day — left unpinned, httpx in particular resolves to
+# whatever langsmith's range currently allows, which can silently drift ahead
+# of the version the agent Lambda pins for its own direct httpx use in
+# ucp_query.
 BEDROCK_DEPENDENCIES = [
     "boto3==1.37.0",
     "langchain-aws==0.2.14",
     "langchain-core==0.3.40",
+    "httpx==0.27.0",
 ]
 
 # The agent Lambda adds the graph loop and the tools' own dependencies: langgraph
-# for the loop, tavily-python for web_search, httpx for ucp_query.
+# for the loop, tavily-python for web_search. httpx (for ucp_query) is already
+# pinned above since the price checker needs it resolved to the same version too.
 AGENT_DEPENDENCIES = [
     *BEDROCK_DEPENDENCIES,
     "langgraph==0.2.74",
     "tavily-python==0.3.9",
-    "httpx==0.27.0",
 ]
 
 # The price checker adds nothing — it imports boto3 and ChatBedrockConverse, and
