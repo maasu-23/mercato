@@ -41,10 +41,10 @@ ROLE_NAME = "mercato-price-checker-role"
 
 LAMBDA_RUNTIME = "python3.11"
 LAMBDA_HANDLER = "price_checker_handler.handler"
-# Items are checked one at a time and each one runs a full agent loop (search, UCP
-# query, Bedrock turns), so the ceiling scales with how many alerts are pending.
-# 5 minutes is Lambda's practical middle ground here; the agent Lambda's 60s is far
-# too short for a batch.
+# Items are checked one at a time, each costing one direct Bedrock call with no tool
+# loop, so the ceiling still scales with how many alerts are pending. 5 minutes is
+# Lambda's practical middle ground here; the agent Lambda's 60s is far too short for
+# a batch.
 LAMBDA_TIMEOUT = 300
 LAMBDA_MEMORY_MB = 512
 
