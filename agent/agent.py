@@ -19,6 +19,20 @@ AWS_REGION = os.getenv("AWS_REGION", DEFAULT_REGION)
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "")
 BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", DEFAULT_MODEL_ID)
 
+# Bedrock prompt caching was investigated for the system prompt + tool schemas
+# below (a ~2,290-token fixed prefix resent on every call) and deliberately NOT
+# implemented. langchain-aws 0.2.14 has no native support, but a SystemMessage
+# content-block passthrough (a raw {"cachePoint": {"type": "default"}} dict,
+# which the library forwards untouched) verifiably produces the correct Bedrock
+# cache-checkpoint shape. It's still useless here: Bedrock requires a minimum
+# token count per checkpoint that varies by model, and Claude Sonnet 4.5 (the
+# model pinned below) requires 4,096 — nearly double this app's entire static
+# prefix. Below the minimum, Bedrock accepts the checkpoint and silently never
+# caches anything (no error — just no benefit). Revisit if the tool surface
+# grows past ~4,096 tokens, or if the model changes to one with a lower
+# per-checkpoint minimum (Claude Sonnet 4.6 and Claude 3.7 Sonnet both require
+# only 1,024, which this prefix already clears).
+#
 # UCP (Universal Commerce Protocol) is an emerging standard with no stable
 # public endpoint as of this writing — api.ucp.dev does not currently resolve.
 # ucp_query is kept in the tool registry as an architectural showcase of

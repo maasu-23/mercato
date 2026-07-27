@@ -26,6 +26,20 @@ def _get_s3_client():
 _NON_FINITE = {"nan", "inf", "-inf", "+inf", "infinity", "-infinity", "+infinity"}
 _CURRENCY_CHARS = "₹$€£,"
 
+# What the model actually needs to present a result and justify a recommendation.
+# source, in_stock, product_id, image_url, and (for web_search items) snippet are
+# deliberately dropped: they're already in this turn's history from the
+# web_search/ucp_query ToolMessage that produced this product, so repeating them
+# here was pure duplication of tokens already paid for once.
+_RANKED_FIELDS = ("title", "price", "currency", "merchant", "url")
+
+
+def _trim_for_ranking(product: dict, best_deal: bool) -> dict:
+    """Reduce a product dict to the fields the model needs, plus its rank flag."""
+    trimmed = {field: product.get(field) for field in _RANKED_FIELDS}
+    trimmed["best_deal"] = best_deal
+    return trimmed
+
 
 def _to_float(value) -> float | None:
     """Coerce a price value to float, returning None if it cannot be parsed."""
@@ -70,11 +84,18 @@ def price_compare(
 
     Returns:
         A dict with keys:
-            ranked: The full sorted product list — priced items cheapest first
-                (each flagged with "best_deal"), followed by unpriced items.
+            ranked: The sorted product list — priced items cheapest first (each
+                flagged with "best_deal"), followed by unpriced items. Each
+                entry is trimmed to title, price, currency, merchant, url, and
+                best_deal — enough to present a result and justify a
+                recommendation, without re-sending fields (source, in_stock,
+                product_id, image_url, snippet) already visible to the model
+                in the web_search/ucp_query tool result earlier this turn.
             total: The number of real products ranked.
-            cheapest: The cheapest priced product dict, or None if no product
-                carried a usable price.
+            cheapest_index: The index into `ranked` of the cheapest priced
+                product — always 0, since priced items sort first — or None
+                if no product carried a usable price. An index rather than a
+                copy of ranked[0], since that object is already in `ranked`.
             s3_artifact: The "s3://..." path of the saved artifact, or None if
                 nothing was saved (including when the upload failed — see below).
 
@@ -97,11 +118,11 @@ def price_compare(
 
     ranked = []
     for index, product in enumerate(priced):
-        ranked.append({**product, "best_deal": index == 0})
+        ranked.append(_trim_for_ranking(product, best_deal=index == 0))
     for product in unpriced:
-        ranked.append({**product, "best_deal": False})
+        ranked.append(_trim_for_ranking(product, best_deal=False))
 
-    cheapest = ranked[0] if priced else None
+    cheapest_index = 0 if priced else None
 
     s3_artifact = None
     bucket_name = os.getenv("S3_BUCKET_NAME", "")
@@ -131,6 +152,6 @@ def price_compare(
     return {
         "ranked": ranked,
         "total": len(ranked),
-        "cheapest": cheapest,
+        "cheapest_index": cheapest_index,
         "s3_artifact": s3_artifact,
     }
